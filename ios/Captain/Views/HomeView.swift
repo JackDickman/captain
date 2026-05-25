@@ -23,7 +23,6 @@ struct HomeView: View {
             background
             content
             chatBar
-            avatarButton
         }
         .fullScreenCover(isPresented: $chatPresented) {
             ChatView(session: session)
@@ -74,7 +73,7 @@ struct HomeView: View {
 
     private var content: some View {
         VStack(alignment: .leading, spacing: 0) {
-            greetingBlock
+            topBlock
             Spacer().frame(height: 22)
             heroImage
             Spacer().frame(height: 18)
@@ -102,8 +101,11 @@ struct HomeView: View {
         return f.string(from: Date())
     }
 
-    private var greetingBlock: some View {
-        HStack(alignment: .bottom, spacing: 12) {
+    /// The home screen's top row. Left: greeting (welcome home + address).
+    /// Right: today's date + the profile-drawer avatar, on the same line,
+    /// vertically centered with the greeting's 2-line column.
+    private var topBlock: some View {
+        HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("welcome home")
                     .font(CaptainTheme.body(13))
@@ -119,43 +121,27 @@ struct HomeView: View {
                 .font(CaptainTheme.body(13))
                 .foregroundStyle(CaptainTheme.textMuted)
                 .lineLimit(1)
-                // Reserve room for the avatar button so the date doesn't
-                // run into it on narrow screens.
-                .padding(.trailing, 36)
+            Button {
+                profilePresented = true
+            } label: {
+                Image(systemName: "person.crop.circle.fill")
+                    .font(.system(size: 22))
+                    .foregroundStyle(CaptainTheme.brass)
+                    .frame(width: 36, height: 36)
+                    .background(Circle().fill(CaptainTheme.creamDeep.opacity(0.6)))
+                    .overlay(
+                        Circle().strokeBorder(
+                            CaptainTheme.brass.opacity(0.4),
+                            lineWidth: 1
+                        )
+                    )
+            }
         }
         .padding(.horizontal, 26)
-        .padding(.top, 28)
-        // Debug: long-press to reset the first session and start over.
+        .padding(.top, 20)
+        // Debug: long-press the row to reset the first session and start over.
         .onLongPressGesture(minimumDuration: 1.0) {
             appState.reset()
-        }
-    }
-
-    /// Small brass "what Captain knows" button in the top-right corner,
-    /// per PRD §7.7 — present but quiet; tap to open the profile drawer.
-    private var avatarButton: some View {
-        VStack {
-            HStack {
-                Spacer()
-                Button {
-                    profilePresented = true
-                } label: {
-                    Image(systemName: "person.crop.circle.fill")
-                        .font(.system(size: 22))
-                        .foregroundStyle(CaptainTheme.brass)
-                        .frame(width: 36, height: 36)
-                        .background(Circle().fill(CaptainTheme.creamDeep.opacity(0.6)))
-                        .overlay(
-                            Circle().strokeBorder(
-                                CaptainTheme.brass.opacity(0.4),
-                                lineWidth: 1
-                            )
-                        )
-                }
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 14)
-            Spacer()
         }
     }
 
