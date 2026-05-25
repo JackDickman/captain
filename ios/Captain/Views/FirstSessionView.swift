@@ -1,0 +1,262 @@
+import PhotosUI
+import SwiftUI
+
+/// The very first thing a new user sees: take/pick a photo of their home,
+/// type the address, submit. On success, AppState transitions to HomeView.
+struct FirstSessionView: View {
+    @EnvironmentObject var appState: AppState
+
+    @State private var photoItem: PhotosPickerItem?
+    @State private var photoData: Data?
+    @State private var address: String = ""
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    private var canSubmit: Bool {
+        photoData != nil
+            && !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isLoading
+    }
+
+    var body: some View {
+        ZStack {
+            CaptainTheme.cream.ignoresSafeArea()
+
+            if isLoading {
+                loadingView
+            } else {
+                formView
+            }
+        }
+        .animation(.easeInOut(duration: 0.4), value: isLoading)
+        .onAppear {
+            // Debug: pin the loading screen indefinitely (for screenshots).
+            if ProcessInfo.processInfo.arguments.contains("--show-loading") {
+                isLoading = true
+                return
+            }
+            maybeAutoSubmit()
+        }
+    }
+
+    /// Debug: when launched with `--auto-submit`, immediately load the
+    /// bundled test photo + canned Silsby address and fire the real
+    /// first-session pipeline. Used to validate the iOS↔backend contract
+    /// end-to-end without manually driving the photo picker.
+    private func maybeAutoSubmit() {
+        guard ProcessInfo.processInfo.arguments.contains("--auto-submit") else { return }
+        guard let url = Bundle.main.url(forResource: "TestHome", withExtension: "jpg"),
+              let data = try? Data(contentsOf: url) else {
+            errorMessage = "Auto-submit: TestHome.jpg not found in bundle"
+            return
+        }
+        photoData = data
+        address = "4221 Silsby Rd, University Heights, OH 44118"
+        // Small delay so the form briefly flashes before loading state.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            submit()
+        }
+    }
+
+    // MARK: - Form
+
+    private var formView: some View {
+        ScrollView {
+            VStack(spacing: 28) {
+                header
+                photoPickerView
+                addressField
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(CaptainTheme.body(13))
+                        .foregroundStyle(CaptainTheme.rust)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+                submitButton
+            }
+            .padding(.top, 56)
+            .padding(.bottom, 32)
+        }
+    }
+
+    private var header: some View {
+        VStack(spacing: 6) {
+            Text("Captain")
+                .font(CaptainTheme.display(42))
+                .foregroundStyle(CaptainTheme.textPrimary)
+            Text("let's get to know your home")
+                .font(CaptainTheme.body(14))
+                .foregroundStyle(CaptainTheme.textMuted)
+        }
+    }
+
+    private var photoPickerView: some View {
+        PhotosPicker(selection: $photoItem, matching: .images) {
+            ZStack {
+                if let photoData, let img = UIImage(data: photoData) {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 260, height: 260)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        // Brass frame — echoes the framed art in the kitchen ref
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .strokeBorder(CaptainTheme.brass, lineWidth: 3)
+                        )
+                        .mcmShadow()
+                } else {
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(CaptainTheme.creamDeep)
+                        .frame(width: 260, height: 260)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .strokeBorder(
+                                    CaptainTheme.walnut.opacity(0.35),
+                                    style: StrokeStyle(lineWidth: 1.5, dash: [6, 4])
+                                )
+                        )
+                        .overlay(placeholderInner)
+                        .mcmShadow(intensity: 0.5)
+                }
+            }
+        }
+        .onChange(of: photoItem) { _, newValue in
+            Task { @MainActor in
+                if let data = try? await newValue?.loadTransferable(type: Data.self) {
+                    photoData = data
+                }
+            }
+        }
+    }
+
+    private var placeholderInner: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "camera.fill")
+                .font(.system(size: 28))
+                .foregroundStyle(CaptainTheme.brass)
+            Text("photo of your home")
+                .font(CaptainTheme.body(14))
+                .foregroundStyle(CaptainTheme.textMuted)
+        }
+    }
+
+    private var addressField: some View {
+        TextField(
+            "",
+            text: $address,
+            prompt: Text("your home's address")
+                .foregroundStyle(CaptainTheme.textMuted),
+            axis: .vertical
+        )
+        .font(CaptainTheme.body(16))
+        .foregroundStyle(CaptainTheme.textPrimary)
+        .textInputAutocapitalization(.words)
+        .autocorrectionDisabled(true)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .background(CaptainTheme.creamDeep)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(CaptainTheme.walnut.opacity(0.18), lineWidth: 1)
+        )
+        .padding(.horizontal, 32)
+        .frame(minHeight: 50)
+    }
+
+    private var submitButton: some View {
+        // Pre-first-session, the app's identity is intentionally muted —
+        // walnut + brass only. The home's palette unlocks the stained-glass
+        // aesthetic after submission.
+        Button(action: submit) {
+            ZStack {
+                (canSubmit ? CaptainTheme.walnut : CaptainTheme.walnut.opacity(0.3))
+                Text("introduce yourself")
+                    .font(CaptainTheme.display(18))
+                    .foregroundStyle(.white)
+                    .padding(.vertical, 16)
+            }
+            .frame(maxWidth: .infinity, minHeight: 56)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(CaptainTheme.brass, lineWidth: canSubmit ? 1.5 : 0)
+            )
+            .mcmShadow(intensity: canSubmit ? 1.0 : 0.3)
+        }
+        .disabled(!canSubmit)
+        .padding(.horizontal, 32)
+    }
+
+    // MARK: - Loading
+
+    /// Full-bleed stained-glass mosaic with the "Captain is getting to know
+    /// your home" message floating on a soft cream card. Turns the long
+    /// first-session wait into a distinctive visual moment rather than a
+    /// spinner-on-blank-screen.
+    private var loadingView: some View {
+        ZStack {
+            StainedGlassPanel(rows: 14, cols: 6)
+                .ignoresSafeArea()
+
+            VStack(spacing: 8) {
+                Text("Captain is getting")
+                    .font(CaptainTheme.display(22))
+                    .foregroundStyle(CaptainTheme.textPrimary)
+                Text("to know your home")
+                    .font(CaptainTheme.display(22))
+                    .foregroundStyle(CaptainTheme.textPrimary)
+                Text("this can take a minute…")
+                    .font(CaptainTheme.body(13))
+                    .foregroundStyle(CaptainTheme.textMuted)
+                    .padding(.top, 6)
+            }
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 28)
+            .padding(.vertical, 22)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(CaptainTheme.cream.opacity(0.96))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .strokeBorder(
+                                CaptainTheme.brass.opacity(0.5),
+                                lineWidth: 1
+                            )
+                    )
+            )
+            .mcmShadow()
+            .padding(.horizontal, 36)
+        }
+    }
+
+    // MARK: - Submit
+
+    private func submit() {
+        guard let photoData else { return }
+        errorMessage = nil
+        isLoading = true
+
+        Task {
+            do {
+                let response = try await CaptainAPI.firstSession(
+                    photo: photoData,
+                    photoFilename: "photo.jpg",
+                    address: address.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+                appState.setFirstSession(response)
+            } catch {
+                errorMessage = error.localizedDescription
+                    + "\n\nMake sure the backend is running on localhost:8000."
+            }
+            isLoading = false
+        }
+    }
+}
+
+#Preview {
+    FirstSessionView()
+        .environmentObject(AppState())
+}
