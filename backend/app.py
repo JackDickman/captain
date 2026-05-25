@@ -26,6 +26,8 @@ import json
 import os
 import shutil
 import sys
+import threading
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -100,11 +102,11 @@ def _fixture_response() -> dict | None:
     """Return canned first-session data if CAPTAIN_DEV_FIXTURE=1.
 
     Lets the iOS app exercise the full flow during UI iteration without
-    burning ~$0.55 + 60 seconds of latency per tap. Returns None when the
-    env flag is off, in which case the real pipeline runs.
+    burning API spend. Returns None when the env flag is off, in which
+    case the real async pipeline runs.
 
-    Uses the existing prototype-output/IMG_0754 renderings and the saved
-    features.json from the validated Silsby run.
+    Wrapped in {status, result, ...} to match the new async response
+    shape; iOS treats `result` being present as "no polling needed".
     """
     if os.getenv("CAPTAIN_DEV_FIXTURE") != "1":
         return None
@@ -114,7 +116,6 @@ def _fixture_response() -> dict | None:
     if not fixture_render_src.exists() or not fixture_features.exists():
         return None
 
-    # Copy renderings into a stable job dir so the static mount serves them.
     job_id = "fixture-silsby"
     job_dir = RENDERED_DIR / job_id
     if not job_dir.exists():
@@ -127,7 +128,7 @@ def _fixture_response() -> dict | None:
     }
     extraction = json.loads(fixture_features.read_text())
     current_season = pick_current_season()
-    return {
+    result = {
         "job_id": job_id,
         "address": "4221 Silsby Rd, University Heights, OH 44118",
         "current_season": current_season,
@@ -142,15 +143,89 @@ def _fixture_response() -> dict | None:
         "source_urls": extraction.get("source_urls", []),
         "fixture": True,
     }
+    return {
+        "job_id": job_id,
+        "status": "done",
+        "stage": "finishing",
+        "message": "Ready",
+        "result": result,
+    }
+
+
+# ---------- Async first-session job tracking ----------
+
+# Per-process in-memory job table. Single-user v1 only; revisit with a
+# real queue (Redis/Celery) when we add multi-tenancy.
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+# User-facing message per stage. Kept short and concrete so the loading
+# screen reads as a quiet narration of what Captain is doing.
+_STAGE_MESSAGES = {
+    "starting": "Captain is getting to know your home",
+    "searching": "Looking up your home in public records…",
+    "studying": "Studying the photo of your home…",
+    "painting": "Painting a portrait of your home…",
+    "finishing": "Almost there…",
+}
+
+
+def _create_job(job_id: str) -> None:
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status": "running",
+            "stage": "starting",
+            "message": _STAGE_MESSAGES["starting"],
+            "started_at": time.time(),
+            "result": None,
+            "error": None,
+        }
+
+
+def _set_stage(job_id: str, stage: str) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is not None:
+            job["stage"] = stage
+            job["message"] = _STAGE_MESSAGES.get(stage, stage)
+
+
+def _finish_job(job_id: str, result: dict) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is not None:
+            job["status"] = "done"
+            job["stage"] = "finishing"
+            job["message"] = "Ready"
+            job["result"] = result
+            job["finished_at"] = time.time()
+
+
+def _fail_job(job_id: str, error: str) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is not None:
+            job["status"] = "error"
+            job["message"] = "Something went wrong"
+            job["error"] = error
+            job["finished_at"] = time.time()
+
+
+def _get_job(job_id: str) -> dict | None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return dict(job) if job else None
 
 
 def _render_remaining_seasons(
     photo_path: Path, job_dir: Path, already_done: set[str]
 ) -> None:
-    """Background task: render the seasonal variants that weren't rendered
-    synchronously. Errors are logged but don't crash anything — the user's
-    first-session response has already been sent. By the time a season
-    changes, these should be cached on disk."""
+    """Background task: render the variants that weren't rendered
+    synchronously. Now includes `base` + the three off-season variants,
+    since current_season is the only sync render. Errors are logged but
+    don't crash anything — the user's first-session response has already
+    been sent. By the time the user navigates to a different season,
+    these should be cached on disk."""
     client = OpenAI()
     for variant_name, prompt in VARIANTS.items():
         if variant_name in already_done:
@@ -164,12 +239,129 @@ def _render_remaining_seasons(
             print(f"[first-session bg] rendered {variant_name}")
 
 
+def _run_first_session_job(
+    job_id: str, address: str, photo_path: Path, job_dir: Path,
+) -> None:
+    """Worker that runs the actual first-session pipeline. Mutates _jobs
+    as it advances through stages. Called from a daemon thread so the
+    POST handler can return immediately."""
+    try:
+        client = OpenAI()
+        current_season = pick_current_season()
+
+        # Stage 1: geocode + firecrawl (cheap network + property scrape)
+        _set_stage(job_id, "searching")
+        coords = geocode.geocode_address(address)
+        lat, lng = coords if coords else (None, None)
+        try:
+            search_results = firecrawl_search(
+                os.environ["FIRECRAWL_API_KEY"],
+                f"{address} property details year built square feet",
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[first-session] firecrawl error (continuing): {e}")
+            search_results = []
+
+        # Stage 2: vision + web feature extraction
+        _set_stage(job_id, "studying")
+        extraction = extract_home_features(
+            client, address, photo_path, search_results,
+        )
+        (job_dir / "features.json").write_text(json.dumps(extraction, indent=2))
+
+        # Stage 3: render the CURRENT SEASON only. `base` and the other
+        # three seasonal variants are background-rendered after the
+        # response — this drops foreground wait by ~30-45s (Lever 1).
+        _set_stage(job_id, "painting")
+        sync_variants = [current_season]
+        renderings: dict[str, str] = {}
+        render_errors: dict[str, str] = {}
+        for variant_name in sync_variants:
+            prompt = VARIANTS[variant_name]
+            # Retry once on safety-classifier false positives — they
+            # almost never re-fire on the same prompt.
+            for attempt in range(2):
+                _, path, err = render_variant(
+                    client, photo_path, variant_name, prompt, job_dir,
+                )
+                if path:
+                    renderings[variant_name] = (
+                        f"/rendered/{job_id}/{variant_name}.png"
+                    )
+                    break
+                if attempt == 1:
+                    render_errors[variant_name] = err
+                    print(
+                        f"[first-session] render error {variant_name}: {err}"
+                    )
+        if not renderings:
+            raise RuntimeError(
+                f"no synchronous renderings produced: {render_errors}"
+            )
+
+        # Stage 4: palette + DB writes
+        _set_stage(job_id, "finishing")
+        try:
+            palette = extract_palette(client, photo_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"[first-session] palette error (empty): {e}")
+            palette = []
+
+        current_rendering_url = renderings.get(current_season)
+
+        home_id = store.upsert_home(
+            address=address,
+            palette=palette,
+            current_rendering_url=current_rendering_url,
+            renderings=renderings,
+            current_season=current_season,
+            job_id=job_id,
+            lat=lat, lng=lng,
+        )
+        extracted_features = extraction.get("features", [])
+        store.replace_first_session_features(home_id, extracted_features)
+        profiles.seed_home_md_from_features(address, extracted_features)
+
+        result = {
+            "job_id": job_id,
+            "address": address,
+            "current_season": current_season,
+            "current_rendering_url": current_rendering_url,
+            "renderings": renderings,
+            "render_errors": render_errors,
+            "palette": palette,
+            "features": extracted_features,
+            "source_urls": extraction.get("source_urls", []),
+        }
+        _finish_job(job_id, result)
+
+        # Background-render `base` + remaining seasons. Failures here
+        # don't matter — the foreground response is already sent.
+        threading.Thread(
+            target=_render_remaining_seasons,
+            args=(photo_path, job_dir, set(renderings.keys())),
+            daemon=True,
+        ).start()
+
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        _fail_job(job_id, str(e))
+
+
 @app.post("/first-session")
 async def first_session(
     address: Annotated[str, Form()],
     photo: Annotated[UploadFile, File()],
-    background_tasks: BackgroundTasks,
 ) -> dict:
+    """Kicks off the first-session pipeline asynchronously.
+
+    Returns immediately with {job_id, status="running"}. iOS then polls
+    GET /first-session/{job_id} every second to read stage / message
+    updates and eventually pick up the full `result`.
+
+    Fixture mode short-circuits and returns the full result inline
+    (no polling needed).
+    """
     fixture = _fixture_response()
     if fixture is not None:
         print("[first-session] returning dev fixture (CAPTAIN_DEV_FIXTURE=1)")
@@ -191,105 +383,35 @@ async def first_session(
     with open(photo_path, "wb") as f:
         shutil.copyfileobj(photo.file, f)
 
-    client = OpenAI()
-    current_season = pick_current_season()
-
-    # 1. Web search for property context (best-effort; failures are non-fatal)
-    try:
-        search_results = firecrawl_search(
-            os.environ["FIRECRAWL_API_KEY"],
-            f"{address} property details year built square feet",
-        )
-    except Exception as e:  # noqa: BLE001
-        print(f"[first-session] firecrawl error (continuing without): {e}")
-        search_results = []
-
-    # 2. Open-ended feature extraction (photo + web)
-    try:
-        extraction = extract_home_features(
-            client, address, photo_path, search_results
-        )
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
-        raise HTTPException(500, f"extraction failed: {e}") from e
-    (job_dir / "features.json").write_text(json.dumps(extraction, indent=2))
-
-    # 3. Render synchronously: just current_season + base. The other three
-    #    seasonal variants are scheduled as a background task so the
-    #    foreground response returns in ~2 min instead of ~5 min. The
-    #    background renders are cached on disk before the season changes
-    #    (months away).
-    sync_variants = {current_season, "base"}
-    renderings: dict[str, str] = {}
-    render_errors: dict[str, str] = {}
-    for variant_name in sync_variants:
-        prompt = VARIANTS[variant_name]
-        _, path, err = render_variant(
-            client, photo_path, variant_name, prompt, job_dir
-        )
-        if err:
-            render_errors[variant_name] = err
-            print(f"[first-session] render error {variant_name}: {err}")
-        elif path:
-            renderings[variant_name] = f"/rendered/{job_id}/{variant_name}.png"
-    if not renderings:
-        raise HTTPException(500, f"no renderings produced: {render_errors}")
-
-    # Background-render the remaining seasons after the response is sent.
-    background_tasks.add_task(
-        _render_remaining_seasons,
-        photo_path, job_dir, set(renderings.keys()),
-    )
-
-    # 4. Palette (vision-based, focused on the home)
-    try:
-        palette = extract_palette(client, photo_path)
-    except Exception as e:  # noqa: BLE001
-        print(f"[first-session] palette error (continuing with empty): {e}")
-        palette = []
-
-    current_rendering_url = (
-        renderings.get(current_season) or renderings.get("base")
-    )
-
-    # Geocode the address so weather + future location-aware features work
-    # for THIS home, not a hardcoded fallback. Best-effort: if Nominatim
-    # can't resolve it, lat/lng stay None and the home falls back to the
-    # backend's DEFAULT coords (Cleveland-ish) for weather.
-    coords = geocode.geocode_address(address)
-    lat, lng = coords if coords else (None, None)
-
-    # Persist to DB so chat has the home record. The features table is kept
-    # as an audit trail of what first-session captured, but chat reads from
-    # the markdown profile (which we seed from these features below).
-    home_id = store.upsert_home(
-        address=address,
-        palette=palette,
-        current_rendering_url=current_rendering_url,
-        renderings=renderings,
-        current_season=current_season,
-        job_id=job_id,
-        lat=lat,
-        lng=lng,
-    )
-    extracted_features = extraction.get("features", [])
-    store.replace_first_session_features(home_id, extracted_features)
-
-    # Seed the markdown home profile from the captured features. Only
-    # writes if the profile is still the initial placeholder — never
-    # overwrites narrative the owner has built up via chat.
-    profiles.seed_home_md_from_features(address, extracted_features)
+    _create_job(job_id)
+    threading.Thread(
+        target=_run_first_session_job,
+        args=(job_id, address, photo_path, job_dir),
+        daemon=True,
+    ).start()
 
     return {
         "job_id": job_id,
-        "address": address,
-        "current_season": current_season,
-        "current_rendering_url": current_rendering_url,
-        "renderings": renderings,
-        "render_errors": render_errors,
-        "palette": palette,
-        "features": extraction.get("features", []),
-        "source_urls": extraction.get("source_urls", []),
+        "status": "running",
+        "stage": "starting",
+        "message": _STAGE_MESSAGES["starting"],
+    }
+
+
+@app.get("/first-session/{job_id}")
+def first_session_status(job_id: str) -> dict:
+    """Poll endpoint. iOS hits this every ~1s after the kickoff POST until
+    `status` becomes 'done' (with a populated `result`) or 'error'."""
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"job {job_id} not found")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "stage": job.get("stage", ""),
+        "message": job.get("message", ""),
+        "result": job.get("result"),
+        "error": job.get("error"),
     }
 
 

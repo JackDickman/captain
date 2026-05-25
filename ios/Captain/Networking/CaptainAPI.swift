@@ -44,14 +44,63 @@ enum CaptainAPI {
         return resized.jpegData(compressionQuality: jpegQuality) ?? data
     }
 
-    /// POST a photo + address to /first-session. Synchronous on the backend,
-    /// so this may take 60-120s in non-fixture mode. Uses a generous
-    /// resource timeout to accommodate that.
+    /// POST a photo + address to /first-session and wait for the result.
+    ///
+    /// Backend is now async: the POST returns immediately with a `job_id`,
+    /// and we poll GET /first-session/{job_id} every second until status
+    /// is "done" (carrying the full `result`) or "error".
+    ///
+    /// `progress` is called on the main actor with each new stage message
+    /// so the loading view can show changing text ("Looking up your home
+    /// in public records…" → "Painting a portrait of your home…" etc).
+    ///
+    /// Fixture mode bypasses polling: the kickoff response carries the
+    /// inline `result` and we return it immediately.
     static func firstSession(
         photo: Data,
         photoFilename: String,
-        address: String
+        address: String,
+        progress: @MainActor @escaping (String) -> Void = { _ in }
     ) async throws -> FirstSessionResponse {
+        let kickoff = try await postFirstSessionKickoff(
+            photo: photo, photoFilename: photoFilename, address: address,
+        )
+        if let result = kickoff.result {
+            return result
+        }
+        guard let jobId = kickoff.jobId else {
+            throw APIError.badStatus(0, "no job_id and no result")
+        }
+        if let initial = kickoff.message {
+            await progress(initial)
+        }
+
+        let started = Date()
+        let maxWait: TimeInterval = 5 * 60  // 5-min safety net
+        while !Task.isCancelled {
+            if Date().timeIntervalSince(started) > maxWait {
+                throw APIError.badStatus(0, "first-session timed out")
+            }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            let status = try await fetchFirstSessionStatus(jobId: jobId)
+            await progress(status.message)
+            switch status.status {
+            case "done":
+                if let result = status.result { return result }
+                throw APIError.badStatus(200, "done but no result")
+            case "error":
+                throw APIError.badStatus(500, status.error ?? "unknown error")
+            default:
+                continue  // still running
+            }
+        }
+        throw CancellationError()
+    }
+
+    /// Multipart POST kickoff. Returns the kickoff envelope without blocking.
+    private static func postFirstSessionKickoff(
+        photo: Data, photoFilename: String, address: String,
+    ) async throws -> FirstSessionKickoff {
         let url = baseURL.appendingPathComponent("first-session")
         let boundary = "Boundary-\(UUID().uuidString)"
         let compressed = compressForUpload(photo)
@@ -62,21 +111,16 @@ enum CaptainAPI {
             "multipart/form-data; boundary=\(boundary)",
             forHTTPHeaderField: "Content-Type"
         )
-        // Backend can hold the connection for 2-3 minutes while it renders
-        // the current-season + base portraits synchronously. Other seasons
-        // render in the background after the response is sent. 600s covers
-        // worst-case bursts with comfortable headroom.
-        request.timeoutInterval = 600
+        // POST should return in <1s now (just kicks off the job).
+        request.timeoutInterval = 30
 
         var body = Data()
         func appendString(_ s: String) {
             body.append(s.data(using: .utf8)!)
         }
-        // address field
         appendString("--\(boundary)\r\n")
         appendString("Content-Disposition: form-data; name=\"address\"\r\n\r\n")
         appendString("\(address)\r\n")
-        // photo field
         appendString("--\(boundary)\r\n")
         appendString(
             "Content-Disposition: form-data; name=\"photo\"; " +
@@ -87,15 +131,7 @@ enum CaptainAPI {
         appendString("\r\n--\(boundary)--\r\n")
         request.httpBody = body
 
-        // A dedicated session with a long resource timeout. URLSession.shared
-        // uses a much shorter default that can kill the request before the
-        // backend's render pass completes.
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 600
-        cfg.timeoutIntervalForResource = 900
-        let session = URLSession(configuration: cfg)
-
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw APIError.badStatus(-1, "no http response")
         }
@@ -103,9 +139,31 @@ enum CaptainAPI {
             let body = String(data: data, encoding: .utf8) ?? "<binary>"
             throw APIError.badStatus(http.statusCode, body)
         }
-
         do {
-            return try JSONDecoder().decode(FirstSessionResponse.self, from: data)
+            return try JSONDecoder().decode(FirstSessionKickoff.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// Poll one tick of /first-session/{job_id}.
+    private static func fetchFirstSessionStatus(
+        jobId: String,
+    ) async throws -> FirstSessionStatus {
+        let url = baseURL.appendingPathComponent("first-session/\(jobId)")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.badStatus(-1, "no http response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw APIError.badStatus(http.statusCode, body)
+        }
+        do {
+            return try JSONDecoder().decode(FirstSessionStatus.self, from: data)
         } catch {
             throw APIError.decoding(error)
         }

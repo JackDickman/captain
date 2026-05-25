@@ -1,6 +1,39 @@
 import Foundation
 
-/// What the backend returns from POST /first-session. Matches backend/app.py.
+/// Initial response from POST /first-session. Either it's a fixture-mode
+/// "done with inline result" envelope, or it's an async kickoff with a
+/// `job_id` we'll poll on. iOS treats `result` being present as
+/// "no polling needed".
+struct FirstSessionKickoff: Codable {
+    let jobId: String?
+    let status: String
+    let stage: String?
+    let message: String?
+    let result: FirstSessionResponse?
+
+    enum CodingKeys: String, CodingKey {
+        case jobId = "job_id"
+        case status, stage, message, result
+    }
+}
+
+/// Response from GET /first-session/{job_id} — polling for stage updates.
+struct FirstSessionStatus: Codable {
+    let jobId: String
+    let status: String   // "running" | "done" | "error"
+    let stage: String
+    let message: String
+    let result: FirstSessionResponse?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case jobId = "job_id"
+        case status, stage, message, result, error
+    }
+}
+
+/// What the backend ultimately returns once the first-session job
+/// completes. Matches backend/app.py's `result` payload.
 struct FirstSessionResponse: Codable, Equatable {
     let jobId: String
     let address: String

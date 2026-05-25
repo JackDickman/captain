@@ -11,6 +11,7 @@ struct FirstSessionView: View {
     @State private var address: String = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var loadingMessage: String = "Captain is getting to know your home"
 
     private var canSubmit: Bool {
         photoData != nil
@@ -192,28 +193,29 @@ struct FirstSessionView: View {
 
     // MARK: - Loading
 
-    /// Full-bleed stained-glass mosaic with the "Captain is getting to know
-    /// your home" message floating on a soft cream card. Turns the long
-    /// first-session wait into a distinctive visual moment rather than a
-    /// spinner-on-blank-screen.
+    /// Full-bleed stained-glass mosaic with a soft cream card narrating
+    /// what Captain is doing right now. The message text is bound to the
+    /// backend's stage updates (via the progress callback in
+    /// CaptainAPI.firstSession), so it animates through stages:
+    /// "Looking up your home…" → "Studying the photo…" → "Painting a
+    /// portrait of your home…" → "Almost there…".
     private var loadingView: some View {
         ZStack {
             StainedGlassPanel(rows: 14, cols: 6)
                 .ignoresSafeArea()
 
             VStack(spacing: 8) {
-                Text("Captain is getting")
+                Text(loadingMessage)
                     .font(CaptainTheme.display(22))
                     .foregroundStyle(CaptainTheme.textPrimary)
-                Text("to know your home")
-                    .font(CaptainTheme.display(22))
-                    .foregroundStyle(CaptainTheme.textPrimary)
+                    .multilineTextAlignment(.center)
+                    .id(loadingMessage)  // forces transition on text change
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
                 Text("this can take a minute…")
                     .font(CaptainTheme.body(13))
                     .foregroundStyle(CaptainTheme.textMuted)
                     .padding(.top, 6)
             }
-            .multilineTextAlignment(.center)
             .padding(.horizontal, 28)
             .padding(.vertical, 22)
             .background(
@@ -230,6 +232,7 @@ struct FirstSessionView: View {
             .mcmShadow()
             .padding(.horizontal, 36)
         }
+        .animation(.easeInOut(duration: 0.45), value: loadingMessage)
     }
 
     // MARK: - Submit
@@ -238,13 +241,17 @@ struct FirstSessionView: View {
         guard let photoData else { return }
         errorMessage = nil
         isLoading = true
+        loadingMessage = "Captain is getting to know your home"
 
         Task {
             do {
                 let response = try await CaptainAPI.firstSession(
                     photo: photoData,
                     photoFilename: "photo.jpg",
-                    address: address.trimmingCharacters(in: .whitespacesAndNewlines)
+                    address: address.trimmingCharacters(in: .whitespacesAndNewlines),
+                    progress: { message in
+                        loadingMessage = message
+                    }
                 )
                 appState.setFirstSession(response)
             } catch {
