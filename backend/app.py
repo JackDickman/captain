@@ -53,7 +53,7 @@ from first_session import (  # noqa: E402
     firecrawl_search,
     pick_current_season,
 )
-from backend import store, profiles, chat as chat_mod  # noqa: E402
+from backend import store, profiles, chat as chat_mod, geocode  # noqa: E402
 
 RENDERED_DIR = Path(__file__).parent / "rendered"
 RENDERED_DIR.mkdir(exist_ok=True)
@@ -252,6 +252,13 @@ async def first_session(
         renderings.get(current_season) or renderings.get("base")
     )
 
+    # Geocode the address so weather + future location-aware features work
+    # for THIS home, not a hardcoded fallback. Best-effort: if Nominatim
+    # can't resolve it, lat/lng stay None and the home falls back to the
+    # backend's DEFAULT coords (Cleveland-ish) for weather.
+    coords = geocode.geocode_address(address)
+    lat, lng = coords if coords else (None, None)
+
     # Persist to DB so chat has the home record. The features table is kept
     # as an audit trail of what first-session captured, but chat reads from
     # the markdown profile (which we seed from these features below).
@@ -262,6 +269,8 @@ async def first_session(
         renderings=renderings,
         current_season=current_season,
         job_id=job_id,
+        lat=lat,
+        lng=lng,
     )
     extracted_features = extraction.get("features", [])
     store.replace_first_session_features(home_id, extracted_features)
