@@ -178,6 +178,23 @@ enum CaptainAPI {
         }
     }
 
+    /// GET /profile — home + owner markdown profiles + full calendar.
+    /// Used by ProfileView (the corner-avatar drawer).
+    static func fetchProfile() async throws -> ProfileResponse {
+        let url = baseURL.appendingPathComponent("profile")
+        let (data, response) = try await URLSession.shared.data(from: url)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.badStatus(code, "")
+        }
+        do {
+            return try JSONDecoder().decode(ProfileResponse.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
     /// GET /weather — structured forecast for the home's location. Used by
     /// the home screen date/weather widget.
     static func fetchWeather() async throws -> [WeatherPeriod] {

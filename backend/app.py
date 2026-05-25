@@ -437,6 +437,22 @@ def weather() -> dict:
     return {"periods": get_forecast_structured(lat, lng, max_periods=14)}
 
 
+@app.get("/profile")
+def get_profile() -> dict:
+    """Everything the iOS profile drawer surfaces: address, home + owner
+    markdown profiles, full calendar. PRD §7.7: this surface is rarely
+    visited and never primary — it just lets the owner see what Captain
+    has gathered."""
+    home = store.get_home()
+    home_id = home["id"] if home else None
+    return {
+        "address": (home or {}).get("address"),
+        "home_md": profiles.read_home_md(),
+        "user_md": profiles.read_user_md(),
+        "calendar": store.get_calendar(home_id) if home_id else [],
+    }
+
+
 @app.get("/messages")
 def get_messages() -> dict:
     """Hydrate the chat view on iOS launch / refresh."""

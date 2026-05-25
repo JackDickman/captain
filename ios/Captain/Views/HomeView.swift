@@ -8,6 +8,7 @@ struct HomeView: View {
     let session: FirstSessionResponse
     @EnvironmentObject var appState: AppState
     @State private var chatPresented = false
+    @State private var profilePresented = false
     @State private var weatherPeriods: [WeatherPeriod] = []
 
     private var accent: Color {
@@ -22,18 +23,27 @@ struct HomeView: View {
             background
             content
             chatBar
+            avatarButton
         }
         .fullScreenCover(isPresented: $chatPresented) {
             ChatView(session: session)
         }
+        .sheet(isPresented: $profilePresented) {
+            ProfileView(session: session)
+        }
         .task { await loadWeather() }
         .onAppear {
-            // Debug: launch with --auto-chat to open ChatView immediately
-            // (used for screenshots and validating chat round-trip without
-            // having to drive the chat-bar tap manually).
-            if ProcessInfo.processInfo.arguments.contains("--auto-chat") {
+            let args = ProcessInfo.processInfo.arguments
+            // Debug: launch with --auto-chat / --show-profile to open the
+            // corresponding sheet immediately (used for screenshots).
+            if args.contains("--auto-chat") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     chatPresented = true
+                }
+            }
+            if args.contains("--show-profile") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    profilePresented = true
                 }
             }
         }
@@ -109,12 +119,43 @@ struct HomeView: View {
                 .font(CaptainTheme.body(13))
                 .foregroundStyle(CaptainTheme.textMuted)
                 .lineLimit(1)
+                // Reserve room for the avatar button so the date doesn't
+                // run into it on narrow screens.
+                .padding(.trailing, 36)
         }
         .padding(.horizontal, 26)
         .padding(.top, 28)
         // Debug: long-press to reset the first session and start over.
         .onLongPressGesture(minimumDuration: 1.0) {
             appState.reset()
+        }
+    }
+
+    /// Small brass "what Captain knows" button in the top-right corner,
+    /// per PRD §7.7 — present but quiet; tap to open the profile drawer.
+    private var avatarButton: some View {
+        VStack {
+            HStack {
+                Spacer()
+                Button {
+                    profilePresented = true
+                } label: {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(CaptainTheme.brass)
+                        .frame(width: 36, height: 36)
+                        .background(Circle().fill(CaptainTheme.creamDeep.opacity(0.6)))
+                        .overlay(
+                            Circle().strokeBorder(
+                                CaptainTheme.brass.opacity(0.4),
+                                lineWidth: 1
+                            )
+                        )
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 14)
+            Spacer()
         }
     }
 
