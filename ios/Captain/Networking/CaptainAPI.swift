@@ -170,7 +170,17 @@ enum CaptainAPI {
     }
 
     /// Build a fully-qualified URL from a server-relative rendering path.
+    ///
+    /// Already-absolute URLs (data:, http://, https://) are passed through
+    /// unchanged — this matters for the optimistic chat-bubble flow, which
+    /// renders a data: URL while the real upload is in flight before the
+    /// fetched message replaces it with a `/chat-photos/...` path.
     static func renderingURL(for relativePath: String) -> URL {
+        if let absolute = URL(string: relativePath),
+           let scheme = absolute.scheme?.lowercased(),
+           scheme == "data" || scheme == "http" || scheme == "https" {
+            return absolute
+        }
         let trimmed = relativePath.hasPrefix("/")
             ? String(relativePath.dropFirst())
             : relativePath
@@ -231,6 +241,26 @@ enum CaptainAPI {
         }
         do {
             return try JSONDecoder().decode(ChatResponse.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// GET /radar — upcoming calendar items + LLM-generated suggestions.
+    /// Used by RadarStrip (compact home-screen card) + RadarView (sheet).
+    static func fetchRadar() async throws -> RadarResponse {
+        let url = baseURL.appendingPathComponent("radar")
+        var request = URLRequest(url: url)
+        // LLM call on cold cache takes ~2-5s; cached is instant.
+        request.timeoutInterval = 30
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.badStatus(code, "")
+        }
+        do {
+            return try JSONDecoder().decode(RadarResponse.self, from: data)
         } catch {
             throw APIError.decoding(error)
         }

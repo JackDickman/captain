@@ -55,7 +55,7 @@ from first_session import (  # noqa: E402
     firecrawl_search,
     pick_current_season,
 )
-from backend import store, profiles, chat as chat_mod, geocode  # noqa: E402
+from backend import store, profiles, chat as chat_mod, geocode, radar  # noqa: E402
 
 RENDERED_DIR = Path(__file__).parent / "rendered"
 RENDERED_DIR.mkdir(exist_ok=True)
@@ -557,6 +557,24 @@ def weather() -> dict:
     lat = home.get("lat") or chat_mod.DEFAULT_LAT
     lng = home.get("lng") or chat_mod.DEFAULT_LNG
     return {"periods": get_forecast_structured(lat, lng, max_periods=14)}
+
+
+@app.get("/radar")
+def get_radar() -> dict:
+    """What's on the owner's plate right now: upcoming calendar items +
+    LLM-generated suggestions tied to the home's profile, weather, and
+    season. Suggestions are cached for 2 hours."""
+    if os.getenv("CAPTAIN_DEV_FIXTURE") == "1":
+        return radar.fixture_radar_response()
+    home = store.get_home()
+    if not home:
+        import time as _time
+        return {
+            "calendar_items": [],
+            "suggestions": [],
+            "generated_at": _time.time(),
+        }
+    return radar.build_radar_response(home["id"])
 
 
 @app.get("/profile")
