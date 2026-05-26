@@ -275,12 +275,79 @@ enum CaptainAPI {
 
     // MARK: - Chat
 
-    /// POST /chat (multipart). Text-only or with one-or-more attached
-    /// photos. Multiple photos are sent as repeated `photos` fields.
+    /// What Captain is doing right now during an in-flight chat turn.
+    /// Surfaced to ChatView so the "thinking" bubble can swap to a
+    /// "searching the web for X" badge while a tool call is running.
+    enum ChatStage: Equatable {
+        case thinking
+        case searching(query: String)
+        case writing
+    }
+
+    /// Send a chat message and wait for Captain's response.
+    ///
+    /// Backend is async: the POST returns either an inline result
+    /// (fixture mode or a scope-gated canned reply — no polling needed)
+    /// or a chat_id we then poll on /chat/{chat_id} until status is
+    /// "done" or "error". The polling carries stage updates so the iOS
+    /// chat surface can show "Captain is checking the web for X…" while
+    /// a tool call is in flight.
     static func sendChatMessage(
         _ text: String,
-        photos: [Data] = []
+        photos: [Data] = [],
+        onStage: @MainActor @escaping (ChatStage) -> Void = { _ in }
     ) async throws -> ChatResponse {
+        let kickoff = try await postChatKickoff(text: text, photos: photos)
+        if let result = kickoff.result {
+            return result  // fixture / scope-gated path, no polling needed
+        }
+        guard let chatId = kickoff.chatId else {
+            throw APIError.badStatus(0, "no chat_id and no result")
+        }
+
+        // Poll until done. 500ms cadence keeps stage updates feeling
+        // live without flooding the backend.
+        let started = Date()
+        let maxWait: TimeInterval = 180
+        while !Task.isCancelled {
+            if Date().timeIntervalSince(started) > maxWait {
+                throw APIError.badStatus(0, "chat timed out")
+            }
+            try await Task.sleep(nanoseconds: 500_000_000)
+            let status = try await fetchChatStatus(chatId: chatId)
+            // Surface the stage to the UI on every poll so the indicator
+            // tracks the backend's current phase.
+            if let stage = status.stage {
+                let mapped: ChatStage
+                switch stage {
+                case "searching":
+                    mapped = .searching(query: status.searchQuery ?? "")
+                case "writing":
+                    mapped = .writing
+                default:
+                    mapped = .thinking
+                }
+                await onStage(mapped)
+            }
+            switch status.status {
+            case "done":
+                if let result = status.result { return result }
+                throw APIError.badStatus(200, "done but no result")
+            case "error":
+                throw APIError.userMessage(status.error ?? "Chat failed.")
+            default:
+                continue  // still running
+            }
+        }
+        throw CancellationError()
+    }
+
+    /// Multipart POST to /chat. Returns the kickoff envelope — either an
+    /// inline `result` (fixture, scope-gated) or just a `chat_id` we'll
+    /// poll on.
+    private static func postChatKickoff(
+        text: String, photos: [Data],
+    ) async throws -> ChatKickoff {
         let url = baseURL.appendingPathComponent("chat")
         let boundary = "Boundary-\(UUID().uuidString)"
 
@@ -290,9 +357,10 @@ enum CaptainAPI {
             "multipart/form-data; boundary=\(boundary)",
             forHTTPHeaderField: "Content-Type"
         )
-        // Chat is fast (~2-5s) text-only; vision adds a few seconds per
-        // photo. Generous timeout so a multi-photo message doesn't die.
-        request.timeoutInterval = 180
+        // The kickoff POST returns fast now (sub-second) — it just spawns
+        // the worker thread. Keep a comfortable timeout for the photo
+        // upload itself.
+        request.timeoutInterval = 60
 
         var body = Data()
         func appendString(_ s: String) {
@@ -303,7 +371,6 @@ enum CaptainAPI {
         appendString("\(text)\r\n")
 
         for (i, photo) in photos.enumerated() {
-            // Compress so each upload + vision call stays snappy.
             let compressed = compressForUpload(photo, maxDim: 1280)
             appendString("--\(boundary)\r\n")
             appendString(
@@ -326,7 +393,30 @@ enum CaptainAPI {
             throw APIError.badStatus(http.statusCode, body)
         }
         do {
-            return try JSONDecoder().decode(ChatResponse.self, from: data)
+            return try JSONDecoder().decode(ChatKickoff.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// Poll one tick of /chat/{chat_id}.
+    private static func fetchChatStatus(
+        chatId: String,
+    ) async throws -> ChatStatus {
+        let url = baseURL.appendingPathComponent("chat/\(chatId)")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.badStatus(-1, "no http response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw APIError.badStatus(http.statusCode, body)
+        }
+        do {
+            return try JSONDecoder().decode(ChatStatus.self, from: data)
         } catch {
             throw APIError.decoding(error)
         }

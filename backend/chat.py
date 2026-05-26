@@ -239,6 +239,11 @@ When you respond:
   - Use the context above to be specific to THIS home and THIS owner. Generic answers betray the whole product.
   - Keep responses concise unless the question genuinely warrants depth. Long lectures break the conversation.
 
+Real-time web search (the `web_search` tool):
+  You have access to a live web search tool. Use it when, and only when, the user's question genuinely requires current or local information that you can't be confident of from training alone — current product prices/specs, current contractor reviews or recommendations in their specific area, recent regulatory or rebate changes, current local conditions where the weather context above isn't enough, or anything where "right now" matters.
+  Do NOT search for general home-care advice that doesn't depend on current info (how to caulk a tub, what mulch type to use, when to prune a hydrangea, what a P-trap is). Do NOT search for things you already know from the profiles. Prefer one concise, specific query (include city/state when local results matter) over multiple speculative ones.
+  When results are weak or empty, just say so plainly and answer with what you do know — never pretend to have found something useful.
+
 Drawing out durable details (the biographer's instinct):
   Part of your job is to capture specifics the owner will be glad to have a year from now. When a conversation naturally touches a moment where a concrete number, brand, vendor, or measurement would be useful later, ask one quiet follow-up — at the END of your response, after you've actually helped — to surface it. Examples:
     - mulching the beds → "Out of curiosity, how many bags did you end up needing? Worth jotting down for next spring."
@@ -256,6 +261,113 @@ Drawing out durable details (the biographer's instinct):
     - NEVER ask about prices paid, costs, or financial figures."""
 
 
+# ---------- Web search tool ----------
+
+# OpenAI tool definition for the `web_search` function. Captain's chat model
+# is given access to this and decides on its own when calling it would help.
+# Description carries the calibration ("use for current/local info you can't
+# be confident of from training; skip for general advice"); the underlying
+# implementation hits Firecrawl.
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the live web for current information. USE THIS when "
+            "the user's question requires information you can't be "
+            "confident of from training alone: current product prices "
+            "or specs, current contractor availability or reviews in a "
+            "specific area, recent regulatory or rebate changes, recent "
+            "news, current weather/pollen/seasonality where the existing "
+            "weather context isn't enough, or anything else where 'live "
+            "right now' matters. DO NOT use for general home-care advice "
+            "that doesn't depend on current info (how to caulk a tub, "
+            "what mulch to use, when to prune a hydrangea) or for facts "
+            "already covered in the home/owner profile. Prefer one "
+            "concise, specific query over multiple speculative ones."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Concise, specific search query. Include the "
+                        "city/state when local results matter."
+                    ),
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# Hard cap on tool-call rounds per chat turn so a confused model can't
+# rack up cost by re-searching repeatedly. After this many rounds the
+# tool is no longer offered and the model must answer with what it has.
+MAX_TOOL_ROUNDS = 2
+
+
+def _do_web_search(query: str) -> str:
+    """Run a Firecrawl search and condense the results into something the
+    LLM can consume as a tool result.
+
+    Returns a string that's always non-empty so the model has something
+    to ground on. On any error or zero-result outcome, returns a brief
+    note explaining the situation — the model is prompted to handle that
+    gracefully (answer from what it knows, acknowledge the gap)."""
+    api_key = os.getenv("FIRECRAWL_API_KEY")
+    if not api_key:
+        return (
+            "Web search is unavailable right now (no API key configured). "
+            "Answer from what you already know and note that you couldn't "
+            "look it up."
+        )
+
+    try:
+        # Imported lazily to avoid the top-level dependency on the
+        # repo-root first_session module from chat.py.
+        from first_session import firecrawl_search
+        results = firecrawl_search(api_key, query)
+    except Exception as e:  # noqa: BLE001
+        print(f"[web_search] firecrawl error: {e}")
+        return (
+            f"Web search failed: {type(e).__name__}. Answer from what "
+            "you already know and note that you couldn't look it up."
+        )
+
+    if not results:
+        return (
+            "Web search returned no results for that query. Answer from "
+            "what you already know and note that you couldn't find live "
+            "information."
+        )
+
+    # Condense top results — title, URL, and a short content excerpt.
+    # The model gets enough to ground a real answer without bloating
+    # context with full scraped pages.
+    blocks: list[str] = []
+    for i, r in enumerate(results[:3], start=1):
+        title = r.get("title") or "(untitled)"
+        url = (
+            r.get("url")
+            or (r.get("metadata") or {}).get("sourceURL")
+            or ""
+        )
+        content = (
+            r.get("markdown")
+            or r.get("description")
+            or r.get("snippet")
+            or ""
+        )
+        # Trim each result so the combined block stays well under the
+        # model's effective tool-result budget.
+        excerpt = content[:1500].strip()
+        blocks.append(f"[{i}] {title}\n{url}\n{excerpt}")
+    return "\n\n---\n\n".join(blocks)
+
+
 def _image_part(path: Path) -> dict:
     """Encode an on-disk image as an OpenAI vision content part."""
     img_b64 = base64.b64encode(path.read_bytes()).decode()
@@ -271,12 +383,23 @@ def respond_to_message(
     home_id: int, user_message: str,
     image_paths: list[Path] | None = None,
     image_urls: list[str] | None = None,
-) -> str:
-    """Foreground: call LLM with full context, persist messages, return text.
+    on_stage: callable | None = None,
+) -> dict:
+    """Foreground: call LLM with full context + web-search tool, persist
+    messages, return a structured result.
 
-    If any `image_paths` are given, they're included in the LLM's user
-    message as vision inputs. `image_urls` are the relative paths stored
-    on the message row so iOS can render bubbles.
+    `on_stage(stage, **kwargs)` is invoked when the chat phase changes
+    so the iOS loading bubble can show what Captain is doing right now:
+      - on_stage("thinking")                       — model is responding
+      - on_stage("searching", query="...")         — tool call in flight
+      - on_stage("writing")                        — model is composing
+                                                     final answer after a
+                                                     tool result came back
+
+    Returns: {"text": str, "searches": [str]}
+      `searches` is the list of search queries the model issued during
+      this turn (in order). iOS uses this to badge the assistant bubble
+      with a "🌐 searched the web for X" footer.
     """
     from .weather import get_forecast_summary
 
@@ -314,17 +437,93 @@ def respond_to_message(
         messages.append({"role": "user", "content": user_message})
 
     client = OpenAI()
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0.7,
-    )
-    assistant_text = resp.choices[0].message.content or ""
+    searches: list[str] = []
+    assistant_text = ""
 
+    # Tool-calling loop: keep calling the model until it stops invoking
+    # tools, or until we hit the round cap. After the cap the tool is
+    # removed from the request so the model has to commit to a final
+    # answer with whatever it has.
+    if on_stage:
+        on_stage("thinking")
+
+    for round_idx in range(MAX_TOOL_ROUNDS + 1):
+        tools = (
+            [WEB_SEARCH_TOOL] if round_idx < MAX_TOOL_ROUNDS else None
+        )
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            tools=tools,
+            temperature=0.7,
+        )
+        choice = resp.choices[0].message
+        tool_calls = getattr(choice, "tool_calls", None) or []
+
+        if not tool_calls:
+            assistant_text = choice.content or ""
+            break
+
+        # Persist the assistant turn that holds the tool call(s). The
+        # OpenAI API requires the function-call message in history
+        # before the matching tool-result messages.
+        messages.append({
+            "role": "assistant",
+            "content": choice.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        # Execute every tool call the model made this round. Today we
+        # only know about `web_search`; unknown names get a polite stub
+        # so the loop can recover.
+        for tc in tool_calls:
+            if tc.function.name == "web_search":
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                query = (args.get("query") or "").strip()
+                if not query:
+                    tool_result = "No query was provided."
+                else:
+                    searches.append(query)
+                    if on_stage:
+                        on_stage("searching", query=query)
+                    print(f"[chat] web_search: {query!r}")
+                    tool_result = _do_web_search(query)
+            else:
+                tool_result = (
+                    f"Unknown tool '{tc.function.name}'. Answer without it."
+                )
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_result,
+            })
+
+        if on_stage:
+            on_stage("writing")
+        # Loop back — model now sees the tool result and either issues
+        # another tool call or produces the final answer.
+
+    # Persist user + assistant messages. The intermediate tool turns are
+    # NOT persisted to chat history (that's an internal LLM mechanism
+    # the user doesn't need to see scroll-back through).
     store.add_message(conv_id, "user", user_message, image_urls=image_urls)
     store.add_message(conv_id, "assistant", assistant_text)
 
-    return assistant_text
+    return {"text": assistant_text, "searches": searches}
 
 
 def extract_calendar_updates(home_id: int, user_message: str,

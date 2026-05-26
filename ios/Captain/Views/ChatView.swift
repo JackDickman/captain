@@ -12,6 +12,10 @@ struct ChatView: View {
     @State private var draft: String = ""
     @State private var isSending = false
     @State private var loadError: String?
+    /// What Captain is doing right now during an in-flight send. Drives
+    /// the "thinking" bubble's content — animated dots for thinking /
+    /// writing, a globe + query badge while a web search is in flight.
+    @State private var sendStage: CaptainAPI.ChatStage = .thinking
     @FocusState private var inputFocused: Bool
 
     // Photo attachment state for the next message (up to MAX_PHOTOS).
@@ -228,6 +232,51 @@ struct ChatView: View {
 
     private var thinkingBubble: some View {
         HStack {
+            thinkingContent
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .background(CaptainTheme.creamDeep)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .strokeBorder(
+                            CaptainTheme.brass.opacity(0.45),
+                            lineWidth: 1
+                        )
+                )
+            Spacer(minLength: 40)
+        }
+        .padding(.horizontal, 16)
+    }
+
+    /// Content of the in-flight assistant bubble. Animated dots for the
+    /// default "thinking" / "writing" phases; a globe + query badge
+    /// while Captain is running a web search so the user can see what's
+    /// being looked up live.
+    @ViewBuilder
+    private var thinkingContent: some View {
+        switch sendStage {
+        case .searching(let query):
+            HStack(spacing: 8) {
+                Image(systemName: "globe")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(CaptainTheme.brass)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("searching the web")
+                        .font(CaptainTheme.label(10))
+                        .foregroundStyle(CaptainTheme.textMuted)
+                        .tracking(0.8)
+                        .textCase(.uppercase)
+                    if !query.isEmpty {
+                        Text(query)
+                            .font(CaptainTheme.body(13, weight: .medium))
+                            .foregroundStyle(CaptainTheme.textPrimary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        case .writing, .thinking:
             HStack(spacing: 4) {
                 ForEach(0..<3, id: \.self) { i in
                     Circle()
@@ -237,17 +286,7 @@ struct ChatView: View {
                         .scaleEffect(thinkingScale(at: i))
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background(CaptainTheme.creamDeep)
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .strokeBorder(CaptainTheme.brass.opacity(0.45), lineWidth: 1)
-            )
-            Spacer(minLength: 40)
         }
-        .padding(.horizontal, 16)
     }
 
     @State private var thinkingPhase: Double = 0
@@ -429,6 +468,7 @@ struct ChatView: View {
         photoData = []
         photoItems = []
         isSending = true
+        sendStage = .thinking
 
         // Optimistic insert — show photos via data: URLs so the bubble
         // appears instantly while the upload runs in the background.
@@ -444,7 +484,13 @@ struct ChatView: View {
         )
         messages.append(optimistic)
         do {
-            _ = try await CaptainAPI.sendChatMessage(text, photos: toSend)
+            _ = try await CaptainAPI.sendChatMessage(
+                text,
+                photos: toSend,
+                onStage: { stage in
+                    sendStage = stage
+                }
+            )
             let fresh = try await CaptainAPI.fetchMessages()
             messages = fresh
         } catch {

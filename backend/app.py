@@ -574,6 +574,120 @@ def first_session_status(job_id: str) -> dict:
 
 # ---------- Chat ----------
 
+# In-memory chat-job registry. Each entry tracks the live state of an
+# in-flight chat turn so iOS can poll for stage updates:
+#   status: "running" | "done" | "error"
+#   stage:  "thinking" | "searching" | "writing"
+#   search_query: the most recent web-search query (when stage == "searching")
+#   result: the final ChatResponse payload (when status == "done")
+#   error:  user-facing error string (when status == "error")
+_chat_jobs: dict[str, dict] = {}
+_chat_jobs_lock = threading.Lock()
+
+# iOS-facing stage labels. Kept here so the prose lives in one place.
+_CHAT_STAGE_LABELS = {
+    "thinking": "Captain is thinking…",
+    "searching": "Captain is checking the web…",
+    "writing": "Captain is writing a response…",
+}
+
+
+def _create_chat_job(chat_id: str) -> None:
+    with _chat_jobs_lock:
+        _chat_jobs[chat_id] = {
+            "status": "running",
+            "stage": "thinking",
+            "stage_label": _CHAT_STAGE_LABELS["thinking"],
+            "search_query": None,
+            "result": None,
+            "error": None,
+            "started_at": time.time(),
+        }
+
+
+def _set_chat_stage(chat_id: str, stage: str, query: str | None = None) -> None:
+    with _chat_jobs_lock:
+        job = _chat_jobs.get(chat_id)
+        if job is None:
+            return
+        job["stage"] = stage
+        job["stage_label"] = _CHAT_STAGE_LABELS.get(stage, stage)
+        job["search_query"] = query
+
+
+def _finish_chat_job(chat_id: str, result: dict) -> None:
+    with _chat_jobs_lock:
+        job = _chat_jobs.get(chat_id)
+        if job is None:
+            return
+        job["status"] = "done"
+        job["stage"] = "done"
+        job["stage_label"] = "Ready"
+        job["result"] = result
+        job["finished_at"] = time.time()
+
+
+def _fail_chat_job(chat_id: str, error: str) -> None:
+    with _chat_jobs_lock:
+        job = _chat_jobs.get(chat_id)
+        if job is None:
+            return
+        job["status"] = "error"
+        job["error"] = error
+        job["finished_at"] = time.time()
+
+
+def _get_chat_job(chat_id: str) -> dict | None:
+    with _chat_jobs_lock:
+        job = _chat_jobs.get(chat_id)
+        return dict(job) if job else None
+
+
+def _run_chat_job(
+    chat_id: str, home_id: int, user_message: str,
+    saved_photo_paths: list[Path], photo_urls: list[str],
+) -> None:
+    """Worker thread for a single chat turn. Wraps respond_to_message
+    with the stage callback so the iOS UI can show what Captain is
+    doing as it works."""
+    def on_stage(stage: str, query: str | None = None) -> None:
+        _set_chat_stage(chat_id, stage, query)
+
+    try:
+        outcome = chat_mod.respond_to_message(
+            home_id, user_message,
+            image_paths=saved_photo_paths,
+            image_urls=photo_urls,
+            on_stage=on_stage,
+        )
+        # The latest message id is the assistant message we just persisted.
+        conv_id = store.get_or_create_conversation(home_id)
+        latest = store.get_recent_messages(conv_id, limit=1)
+        msg_id = latest[0]["id"] if latest else -1
+
+        result = {
+            "message_id": msg_id,
+            "response": outcome["text"],
+            "image_urls": photo_urls,
+            "searches": outcome.get("searches") or [],
+        }
+        _finish_chat_job(chat_id, result)
+
+        # Background: rewrite markdown profiles + extract calendar entries.
+        # Same as before — runs after we've already returned the result.
+        try:
+            chat_mod.update_memory_from_exchange(
+                home_id, user_message, outcome["text"],
+                saved_photo_paths,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[chat-job] memory update failed: {e}")
+
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        _fail_chat_job(chat_id, f"chat failed: {e}")
+
+
 def _send_canned_chat_reply(
     home_id: int, user_message: str, photo_urls: list[str],
     canned_text: str,
@@ -684,10 +798,13 @@ async def chat(
         )
         msg_id = store.add_message(conv_id, "assistant", assistant_text)
         return {
-            "message_id": msg_id,
-            "response": assistant_text,
-            "image_urls": photo_urls,
-            "fixture": True,
+            "status": "done",
+            "result": {
+                "message_id": msg_id,
+                "response": assistant_text,
+                "image_urls": photo_urls,
+                "fixture": True,
+            },
         }
 
     if not os.getenv("OPENAI_API_KEY"):
@@ -704,44 +821,60 @@ async def chat(
             print(f"[scope] {scope}: {reason}")
 
     if scope == "off_topic":
-        return _send_canned_chat_reply(
+        inline = _send_canned_chat_reply(
             home_id, user_message, photo_urls,
             chat_mod.OFF_TOPIC_REPLY,
         )
+        # Wrap in the async envelope so iOS can use one polling client
+        # for both inline and async cases.
+        return {"status": "done", "result": inline}
     if scope == "out_of_capability":
-        return _send_canned_chat_reply(
+        inline = _send_canned_chat_reply(
             home_id, user_message, photo_urls,
             chat_mod.OUT_OF_CAPABILITY_REPLY,
         )
+        return {"status": "done", "result": inline}
 
-    try:
-        assistant_text = chat_mod.respond_to_message(
-            home_id, user_message,
-            image_paths=saved_photo_paths,
-            image_urls=photo_urls,
-        )
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
-        raise HTTPException(500, f"chat failed: {e}") from e
-
-    # The user + assistant messages are already persisted inside
-    # respond_to_message. We just need the latest message id.
-    conv_id = store.get_or_create_conversation(home_id)
-    latest = store.get_recent_messages(conv_id, limit=1)
-    msg_id = latest[0]["id"] if latest else -1
-
-    # Background: rewrite markdown profiles + extract calendar entries.
-    # Failures here don't affect the foreground response.
-    background_tasks.add_task(
-        chat_mod.update_memory_from_exchange,
-        home_id, user_message, assistant_text,
-        saved_photo_paths,
-    )
+    # Real LLM path: kick off async job, return chat_id immediately.
+    # iOS polls /chat/{chat_id} to see stage updates (thinking / searching
+    # / writing) and to pick up the final result.
+    chat_id = uuid.uuid4().hex[:12]
+    _create_chat_job(chat_id)
+    threading.Thread(
+        target=_run_chat_job,
+        args=(chat_id, home_id, user_message, saved_photo_paths, photo_urls),
+        daemon=True,
+    ).start()
 
     return {
-        "message_id": msg_id,
-        "response": assistant_text,
-        "image_urls": photo_urls,
+        "chat_id": chat_id,
+        "status": "running",
+        "stage": "thinking",
+        "stage_label": _CHAT_STAGE_LABELS["thinking"],
+    }
+
+
+@app.get("/chat/{chat_id}")
+def chat_status(chat_id: str) -> dict:
+    """Poll endpoint for an in-flight chat turn. iOS hits this every
+    ~500ms after the kickoff POST until status is 'done' (with a
+    populated `result`) or 'error'.
+
+    The interesting payload during the running phase is `stage` +
+    `search_query` — when stage is "searching", search_query holds the
+    query the model just invoked, so the iOS bubble can render a clear
+    "searching the web for X" indicator."""
+    job = _get_chat_job(chat_id)
+    if job is None:
+        raise HTTPException(404, f"chat {chat_id} not found")
+    return {
+        "chat_id": chat_id,
+        "status": job["status"],
+        "stage": job.get("stage", ""),
+        "stage_label": job.get("stage_label", ""),
+        "search_query": job.get("search_query"),
+        "result": job.get("result"),
+        "error": job.get("error"),
     }
 
 
