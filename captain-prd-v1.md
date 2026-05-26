@@ -1,8 +1,8 @@
 # Captain — Product Requirements Document (v1)
 
 **Version:** 1.0
-**Last updated:** May 23, 2026
-**Status:** Draft — personal pet project
+**Last updated:** May 26, 2026
+**Status:** Draft — personal pet project, under active build
 
 ---
 
@@ -152,6 +152,8 @@ Captain's chat behavior:
 - Uses web search when current or local information matters
 - Helps the user *decide* what to do and *who* to call — including reading reviews and surfacing options — rather than just dumping search results
 - Quietly updates the home profile, personal profile, and calendar as a side effect of conversation
+- **Draws out durable details.** When a conversation naturally surfaces a specific the user will want a year from now — bags of mulch used, paint brand, plant counts, filter size, vendor name — Captain asks one short follow-up at the *end* of its response. Help first, ask second. One question per turn. Never asks about prices or costs (no financial surfaces per §10).
+- **Stays in its lane.** A lightweight scope gate runs before each chat turn. Off-topic messages (homework help, coding, dating, etc.) and capability-overreach asks (generate an image, send an email, place an order) get a quiet redirect rather than a long answer. Lenient by default; only catches clear cases.
 
 ### 6.6 Home screen
 
@@ -190,7 +192,7 @@ Three principles drive every UI/UX decision:
 
 ### 7.2 The rendered home
 
-The first-session photo isn't just stored — Captain renders the user's home as a stylized illustration. Same house, same proportions, same key features (door color, porch, trees, siding), but rendered as a piece of art rather than a photograph. The intended emotional register is **nostalgic** — something that feels like a memory of home, a portrait, a keepsake. Not a real estate listing photo, not a cartoon.
+The first-session photo isn't just stored — Captain renders the user's home as a stylized illustration. The current style is a Charles Schulz / Peanuts register: confident hand-drawn outlines, flat color fills, limited mid-century palette, charming imperfection. Same house, same proportions, same key features (door color, porch, trees, siding), but rendered as a piece of art rather than a photograph. The intended emotional register is **nostalgic** — something that feels like a memory of home, a portrait, a keepsake. Not a real estate listing photo.
 
 The rendered home is responsive to context:
 
@@ -201,7 +203,13 @@ The rendered home is responsive to context:
 
 Every time the user opens Captain, they see a portrait of their home in this moment. That alone is meant to be the daily reason to come back.
 
-This is a meaningful technical bet (see §12 — Open questions) and should be validated early. A safer fallback if rendering quality is inconsistent: use the actual photo with tasteful seasonal/weather overlays and lighting treatments. Less magical but still distinctive.
+This was a meaningful technical bet (see §12) and early prototyping has been encouraging — the Schulz register reads cleanly across the test homes we've tried, and the seasonal variants land with the right emotional weight. Worth continuing to validate on more home types.
+
+**Render guardrails:**
+
+- No text or numerals anywhere in the image. The prompt explicitly forbids street numbers, mailbox lettering, address plaques, name plaques, decorative monograms, license plates, dates carved into stonework, security yard signs, realtor signs, and any other text. A wrong-but-confident number on a rendered home would feel sloppy and break trust.
+- No neighboring buildings, vehicles, or unrelated structures — the subject home is centered and fills most of the canvas.
+- Seasonal decorations in the source photo are cleaned up unless they're appropriate to the season being rendered.
 
 ### 7.3 Color palette derived from the home
 
@@ -218,16 +226,16 @@ The default screen on app open:
 
 ### 7.5 The radar — accessible but not in the user's face
 
-What's on the radar right now — upcoming reminders, seasonal nudges, forward-dated calendar items, recent observations — is important but should not be the first thing the user sees. The home and its emotional tone come first.
+What's on the radar right now is important but should not be the first thing the user sees. The home and its emotional tone come first.
 
-The radar lives in a **bottom sheet** above the chat input. On the home screen, a small handle is visible — enough to signal "there's something here" without showing the contents. The handle's state communicates whether anything needs attention:
+**Two streams flow into the radar:**
 
-- **Things on the radar:** the handle is visually present, possibly with a small count or accent.
-- **Nothing pressing:** the handle is calm and minimal — present enough that the user knows the surface exists, with no visual urgency.
+- **Calendar items.** Future-dated entries Captain has captured from chat (intents like "planning to repaint the deck in May") plus recurring patterns ("I always mow on Saturdays").
+- **AI-generated suggestions.** Two to four concrete things worth considering in the next 30 days, generated against the home profile, owner profile, calendar, weather, and current date. Specific to *this* home and *this* owner — never generic homeowner advice. Cached for two hours; refreshed when the profile or calendar meaningfully changes.
 
-The user can tug the sheet up partially to see the top items, pull it further to see the full upcoming calendar, and pull it all the way up to access the full home record (past and future). This collapses the radar, the calendar, and the home's biography into one continuous gesture.
+**The home-screen surface:** a compact card between the weather widget and the chat input. The card surfaces a tone-calibrated lead line ("a couple things to consider this week" / "nothing pressing on your radar"), a breakdown of the two streams ("3 coming up · 4 to consider"), and a small cluster of category icons hinting at what's inside. Beneath those, a single peek row shows the most relevant item — the soonest calendar entry in the next two weeks, or the top suggestion otherwise.
 
-Pulling the sheet back down returns the user to the home view.
+**Tapping the card opens the full radar view** as a sheet — two sections ("Coming up" / "Things to consider") with each item's reason and timeframe. This replaces the originally-proposed pull-up bottom-sheet gesture (which collapsed radar + calendar + biography into one sweep); the simpler card + sheet pattern lands the same intent with clearer affordances and less gesture learning. The full home biography lives in the profile drawer instead (see §7.7).
 
 ### 7.6 The chat surface
 
@@ -250,13 +258,12 @@ Editing is always possible but never required.
 
 The entire v1 app navigates with:
 
-- **Tap chat input** → enter chat
-- **Pull up bottom sheet** → see radar, calendar, full record
-- **Pull down bottom sheet** → return to home
-- **Tap corner avatar** → access profiles and settings
+- **Tap chat input** → enter chat (full-screen cover)
+- **Tap the radar card** → open the full radar sheet
+- **Tap corner avatar** → access profiles and full calendar
 - **Tap a radar item, calendar entry, or chat suggestion** → enter chat with that context
 
-No tab bar. No hamburger menu. No back buttons except where iOS conventions require them.
+No tab bar. No hamburger menu. No back buttons except where iOS conventions require them. Sheets dismiss via a chevron-down button or standard iOS swipe-down.
 
 ### 7.9 Risks and things to validate
 
@@ -327,27 +334,27 @@ These power the user-facing intelligence.
 
 - **Weather forecast data.** Needed for weekend planning, seasonal nudges, and "should I do this outside today" questions. The National Weather Service API is free for US use and sufficient for v1.
 - **Hardiness zone.** Derivable from coordinates against publicly available USDA data — no API or cost.
-- **Geocoding / reverse geocoding.** GPS coordinates from the user's first photo need to become a street address. Apple's MapKit (already available on iOS) covers this without an additional paid service.
+- **Geocoding.** The address the user enters at first-session needs to become latitude/longitude for the weather feed. The US Census Bureau's geocoder is free, no key, generous limits, and excellent coverage of US residential addresses — used server-side. (Originally planned to use Apple MapKit on-device; server-side Census fits the architecture better and lets the backend independently validate addresses during setup.)
 - **Property details via web search scraping.** Rather than paying for a property data aggregator (ATTOM, Regrid, etc.), v1 attempts to gather year built, square footage, lot size, last sale date, and similar by performing a web search against the user's address. The LLM extracts what's available from public listings, county records sites, and real estate pages. Coverage is expected to be inconsistent: some addresses will return rich data, others will return little. Captain should degrade gracefully — for example, by asking the user to confirm or fill in missing details. Worth validating early with a handful of test addresses to see what realistic coverage looks like before committing further on this path.
 - **Web search.** Used both for property details (above) and for the "who do I call" judgment layer, current local info, and anything the model doesn't know directly. A cheap search API (Brave Search, Tavily) is preferred over rolling our own scraper.
 - **Image understanding via the LLM.** Rather than integrating dedicated plant ID, OCR, or appliance recognition services, v1 relies on the LLM's native vision capability for photo-derived extraction. Good enough for v1 use cases.
 
 ### 9.3 Image handling philosophy for v1
 
-To minimize storage cost and complexity, v1 does **not** persist user-uploaded images. The flow is:
+The flow for every user-uploaded photo:
 
-1. User uploads a photo (first-session house, scavenger hunt, chat).
+1. User uploads a photo (first-session house, future scavenger hunt, chat).
 2. The LLM extracts everything useful from the image (text, structured fields, observations, descriptions).
 3. The extracted information is written to the home profile, personal profile, or calendar.
-4. The image is discarded.
+4. The image is retained on the backend so the chat UI can display the bubble (now and on subsequent app launches).
 
-The one exception is the first-session house photo, which drives the home screen visual and UI color palette — that one image (or a derivative of it) needs to be kept. Everything else: extract and dump.
+The original PRD position was "extract and dump" to minimize storage. v1 currently retains chat photos for two reasons: (a) the chat UX is much better if the user can scroll back through a conversation and still see the photos they sent, and (b) at the personal-pet-project scale, storage cost is negligible. The first-session photo is kept regardless because it drives the rendered home and palette.
 
-The tradeoffs of this choice (worth being aware of):
+The tradeoffs:
 
-- Users can't browse a photo history of their home in v1.
-- Re-querying an image later isn't possible — if Captain missed something the first time, it's gone.
-- The calendar / passport is text-only, no photo timeline.
+- Storage grows linearly with chat usage. Acceptable at pet-project scale; would need a cleanup policy at real scale.
+- Re-querying an image later isn't currently supported — extraction happens once, in the moment. Possible to revisit since the photo is still there.
+- The calendar / passport is still text-only — calendar entries describe what was observed but don't link to the photo.
 
 These tradeoffs are acceptable for a pet-project v1 and worth revisiting if the product grows.
 
