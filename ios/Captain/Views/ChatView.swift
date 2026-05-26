@@ -21,6 +21,12 @@ struct ChatView: View {
     // Photo attachment state for the next message (up to MAX_PHOTOS).
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var photoData: [Data] = []
+    /// Whether the system photo picker is currently presented. Bound
+    /// from the photo-source Menu's "Photo Library" item.
+    @State private var showingLibrary = false
+    /// Whether the camera capture sheet is presented. Bound from the
+    /// photo-source Menu's "Take Photo" item.
+    @State private var showingCamera = false
     private let maxPhotos = 5
 
     var body: some View {
@@ -474,13 +480,29 @@ struct ChatView: View {
         photoData.isEmpty ? "ask about your home…" : "add a note (optional)…"
     }
 
+    /// Photo source menu — tap the brass camera button to choose between
+    /// the system photo library (multi-select) and the in-app camera
+    /// (one shot per tap, repeat to add more). Picks accumulate into
+    /// `photoData` up to `maxPhotos`. Both items disable when the
+    /// pending strip is already full.
     private var photoButton: some View {
-        PhotosPicker(
-            selection: $photoItems,
-            maxSelectionCount: maxPhotos,
-            selectionBehavior: .ordered,
-            matching: .images
-        ) {
+        let slotsLeft = max(0, maxPhotos - photoData.count)
+        let cameraAvailable = UIImagePickerController.isSourceTypeAvailable(.camera)
+        return Menu {
+            Button {
+                showingLibrary = true
+            } label: {
+                Label("Photo Library", systemImage: "photo.on.rectangle")
+            }
+            .disabled(slotsLeft == 0)
+
+            Button {
+                showingCamera = true
+            } label: {
+                Label("Take Photo", systemImage: "camera.fill")
+            }
+            .disabled(slotsLeft == 0 || !cameraAvailable)
+        } label: {
             Image(systemName: "camera.fill")
                 .font(.system(size: 15))
                 .foregroundStyle(CaptainTheme.brass)
@@ -488,19 +510,47 @@ struct ChatView: View {
                 .background(Circle().fill(CaptainTheme.creamDeep))
                 .overlay(
                     Circle()
-                        .strokeBorder(CaptainTheme.brass.opacity(0.4), lineWidth: 1)
+                        .strokeBorder(
+                            CaptainTheme.brass.opacity(0.4),
+                            lineWidth: 1
+                        )
                 )
         }
+        .photosPicker(
+            isPresented: $showingLibrary,
+            selection: $photoItems,
+            maxSelectionCount: max(1, slotsLeft),
+            selectionBehavior: .ordered,
+            matching: .images
+        )
         .onChange(of: photoItems) { _, newItems in
+            // Library selections are appended to (not replacing) the
+            // pending strip, so users can mix library + camera picks
+            // within a single message.
             Task { @MainActor in
+                guard !newItems.isEmpty else { return }
                 var loaded: [Data] = []
                 for item in newItems {
-                    if let data = try? await item.loadTransferable(type: Data.self) {
+                    if let data = try? await item.loadTransferable(
+                        type: Data.self,
+                    ) {
                         loaded.append(data)
                     }
                 }
-                photoData = loaded
+                let combined = photoData + loaded
+                photoData = Array(combined.prefix(maxPhotos))
+                // Clear the picker's selection state so the next open
+                // starts fresh (otherwise the previously-picked items
+                // would re-load on every subsequent invocation).
+                photoItems = []
             }
+        }
+        .sheet(isPresented: $showingCamera) {
+            CameraPicker { data in
+                guard photoData.count < maxPhotos else { return }
+                photoData.append(data)
+            }
+            .ignoresSafeArea()
         }
     }
 
