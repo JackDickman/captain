@@ -113,11 +113,38 @@ struct ChatView: View {
                 .padding(.vertical, 18)
             }
             .onChange(of: messages.count) { _, _ in
-                withAnimation { proxy.scrollTo(messages.last?.id, anchor: .bottom) }
+                guard let last = messages.last else { return }
+                withAnimation {
+                    // Anchor differs by role:
+                    //  - User's own message: pin to the BOTTOM so the
+                    //    bubble they just sent sits right above the
+                    //    input bar (familiar chat behavior).
+                    //  - Assistant's message: pin to the TOP so a long
+                    //    answer starts at the start, not buried at the
+                    //    bottom with the user having to scroll up to
+                    //    read the opening.
+                    if last.role == .assistant {
+                        proxy.scrollTo(last.id, anchor: .top)
+                    } else {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
             }
             .onChange(of: isSending) { _, sending in
                 if sending {
-                    withAnimation { proxy.scrollTo("thinking", anchor: .bottom) }
+                    withAnimation {
+                        proxy.scrollTo("thinking", anchor: .bottom)
+                    }
+                }
+            }
+            .onChange(of: sendStage) { _, _ in
+                // The thinking bubble grows when the model invokes a
+                // web search (from animated dots to a 2-line globe +
+                // query badge). Re-scroll on every stage change so the
+                // bubble's new bottom stays visible above the input bar.
+                guard isSending else { return }
+                withAnimation {
+                    proxy.scrollTo("thinking", anchor: .bottom)
                 }
             }
         }
