@@ -153,6 +153,101 @@ def _fixture_response() -> dict | None:
     }
 
 
+# ---------- Speculative prerender ----------
+
+# In-memory registry of in-flight prerenders. Keyed by prefetch_id.
+# Each entry: {photo_path, season, done_event, render_path, error,
+# started_at}. The done_event is set when the background render finishes
+# (success or failure) so /first-session can wait on it deterministically.
+_prerenders: dict[str, dict] = {}
+_prerenders_lock = threading.Lock()
+
+
+def _run_prerender(
+    prefetch_id: str, photo_path: Path, season: str,
+    out_dir: Path, done_event: threading.Event,
+) -> None:
+    """Background render of the current-season variant for a prefetch.
+    Failures are recorded on the registry entry; /first-session falls back
+    to a fresh render if the prefetch's render didn't land."""
+    try:
+        client = OpenAI()
+        prompt = VARIANTS[season]
+        _, path, err = render_variant(
+            client, photo_path, season, prompt, out_dir,
+        )
+        with _prerenders_lock:
+            pr = _prerenders.get(prefetch_id)
+            if pr is not None:
+                pr["render_path"] = str(path) if path else None
+                pr["error"] = err
+        elapsed = time.time() - _prerenders[prefetch_id]["started_at"]
+        if path:
+            print(f"[prerender] {prefetch_id} rendered {season} in "
+                  f"{elapsed:.1f}s")
+        else:
+            print(f"[prerender] {prefetch_id} render failed in "
+                  f"{elapsed:.1f}s: {err}")
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        with _prerenders_lock:
+            pr = _prerenders.get(prefetch_id)
+            if pr is not None:
+                pr["error"] = str(e)
+    finally:
+        done_event.set()
+
+
+@app.post("/prerender")
+async def prerender(
+    photo: Annotated[UploadFile, File()],
+) -> dict:
+    """Speculative render: kick off the current-season render as soon as
+    the user picks a photo, so by the time they type their address and
+    submit, the slowest stage is already done or close to done.
+
+    Returns prefetch_id immediately. The actual render runs in a daemon
+    thread. If the user abandons (closes the app, picks a different
+    photo), the render still completes and is discarded — accepted spend
+    in exchange for ~30s shaved off the perceived loading time.
+    """
+    if os.getenv("CAPTAIN_DEV_FIXTURE") == "1":
+        return {"prefetch_id": None, "skipped": True}
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(500, "OPENAI_API_KEY missing on backend")
+
+    prefetch_id = uuid.uuid4().hex[:12]
+    pr_dir = RENDERED_DIR / prefetch_id
+    pr_dir.mkdir()
+
+    suffix = Path(photo.filename or "upload.jpg").suffix.lower() or ".jpg"
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(400, f"unsupported photo format: {suffix}")
+    photo_path = pr_dir / f"original{suffix}"
+    with open(photo_path, "wb") as f:
+        shutil.copyfileobj(photo.file, f)
+
+    season = pick_current_season()
+    done_event = threading.Event()
+    with _prerenders_lock:
+        _prerenders[prefetch_id] = {
+            "photo_path": str(photo_path),
+            "season": season,
+            "done_event": done_event,
+            "render_path": None,
+            "error": None,
+            "started_at": time.time(),
+        }
+
+    threading.Thread(
+        target=_run_prerender,
+        args=(prefetch_id, photo_path, season, pr_dir, done_event),
+        daemon=True,
+    ).start()
+
+    return {"prefetch_id": prefetch_id}
+
+
 # ---------- Async first-session job tracking ----------
 
 # Per-process in-memory job table. Single-user v1 only; revisit with a
@@ -243,6 +338,7 @@ def _render_remaining_seasons(
 
 def _run_first_session_job(
     job_id: str, address: str, photo_path: Path, job_dir: Path,
+    *, prefetch_id: str | None = None,
 ) -> None:
     """Worker that runs the actual first-session pipeline. Mutates _jobs
     as it advances through stages. Called from a daemon thread so the
@@ -287,6 +383,23 @@ def _run_first_session_job(
         # three seasonal variants are background-rendered after the
         # response — this drops foreground wait by ~30-45s (Lever 1).
         _set_stage(job_id, "painting")
+
+        # If this job came in with a prefetch_id, a prerender thread is
+        # already producing rendered/<id>/<current_season>.png. Wait on
+        # its done_event so render_variant's "skip if exists" check finds
+        # the completed file (or falls back to a fresh render if the
+        # prerender failed). Timeout is generous — prerender usually
+        # started 10-30s before the user typed their address, so most of
+        # the wait is already absorbed.
+        if prefetch_id:
+            with _prerenders_lock:
+                pr = _prerenders.get(prefetch_id)
+            if pr is not None:
+                waited_start = time.time()
+                pr["done_event"].wait(timeout=120)
+                print(f"[first-session] {job_id} waited "
+                      f"{time.time() - waited_start:.1f}s on prerender")
+
         sync_variants = [current_season]
         renderings: dict[str, str] = {}
         render_errors: dict[str, str] = {}
@@ -365,13 +478,18 @@ def _run_first_session_job(
 @app.post("/first-session")
 async def first_session(
     address: Annotated[str, Form()],
-    photo: Annotated[UploadFile, File()],
+    photo: Annotated[Optional[UploadFile], File()] = None,
+    prefetch_id: Annotated[Optional[str], Form()] = None,
 ) -> dict:
     """Kicks off the first-session pipeline asynchronously.
 
     Returns immediately with {job_id, status="running"}. iOS then polls
     GET /first-session/{job_id} every second to read stage / message
     updates and eventually pick up the full `result`.
+
+    If `prefetch_id` is given (from a prior /prerender call), the photo
+    upload is optional — the backend reuses the already-saved photo and
+    the in-flight render. Otherwise a fresh photo upload is required.
 
     Fixture mode short-circuits and returns the full result inline
     (no polling needed).
@@ -386,21 +504,46 @@ async def first_session(
     if not os.getenv("FIRECRAWL_API_KEY"):
         raise HTTPException(500, "FIRECRAWL_API_KEY missing on backend")
 
-    job_id = uuid.uuid4().hex[:12]
-    job_dir = RENDERED_DIR / job_id
-    job_dir.mkdir()
-
-    suffix = Path(photo.filename or "upload.jpg").suffix.lower() or ".jpg"
-    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
-        raise HTTPException(400, f"unsupported photo format: {suffix}")
-    photo_path = job_dir / f"original{suffix}"
-    with open(photo_path, "wb") as f:
-        shutil.copyfileobj(photo.file, f)
+    if prefetch_id:
+        # Reuse the prerender directory + photo. The job_id IS the
+        # prefetch_id so rendered/<id>/<season>.png written by the
+        # prerender thread is in the right place for render_variant to
+        # find via its "skip if exists" short-circuit.
+        with _prerenders_lock:
+            pr = _prerenders.get(prefetch_id)
+        if pr is None:
+            raise HTTPException(
+                400, "Photo expired — please reselect and try again."
+            )
+        job_id = prefetch_id
+        job_dir = RENDERED_DIR / job_id
+        photo_path = Path(pr["photo_path"])
+        if not photo_path.exists():
+            raise HTTPException(
+                400, "Photo missing — please reselect and try again."
+            )
+    else:
+        if photo is None or not getattr(photo, "filename", ""):
+            raise HTTPException(
+                400, "photo required when no prefetch_id is provided"
+            )
+        job_id = uuid.uuid4().hex[:12]
+        job_dir = RENDERED_DIR / job_id
+        job_dir.mkdir()
+        suffix = (
+            Path(photo.filename or "upload.jpg").suffix.lower() or ".jpg"
+        )
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            raise HTTPException(400, f"unsupported photo format: {suffix}")
+        photo_path = job_dir / f"original{suffix}"
+        with open(photo_path, "wb") as f:
+            shutil.copyfileobj(photo.file, f)
 
     _create_job(job_id)
     threading.Thread(
         target=_run_first_session_job,
         args=(job_id, address, photo_path, job_dir),
+        kwargs={"prefetch_id": prefetch_id},
         daemon=True,
     ).start()
 

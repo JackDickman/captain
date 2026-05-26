@@ -12,6 +12,11 @@ struct FirstSessionView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var loadingMessage: String = "Captain is getting to know your home"
+    /// Speculative-prerender id from /prerender. Set in the background as
+    /// soon as the user picks a photo; passed to /first-session on submit
+    /// so the backend can skip re-uploading and re-rendering.
+    @State private var prefetchId: String?
+    @State private var prefetchTask: Task<Void, Never>?
 
     private var canSubmit: Bool {
         photoData != nil
@@ -127,8 +132,32 @@ struct FirstSessionView: View {
             Task { @MainActor in
                 if let data = try? await newValue?.loadTransferable(type: Data.self) {
                     photoData = data
+                    // Kick off speculative prerender so the slowest stage
+                    // is already running by the time the user types their
+                    // address and submits. Cancel any in-flight prefetch
+                    // from a previously-selected photo first.
+                    prefetchTask?.cancel()
+                    prefetchId = nil
+                    prefetchTask = Task { await runPrefetch(data) }
                 }
             }
+        }
+    }
+
+    /// Background prerender call. Silent on failure — submit will fall
+    /// back to the regular photo-upload + fresh-render path if this
+    /// didn't land. Sets `prefetchId` on success so submit() can pass
+    /// it through.
+    private func runPrefetch(_ data: Data) async {
+        do {
+            let id = try await CaptainAPI.prerender(photo: data)
+            if Task.isCancelled { return }
+            await MainActor.run { self.prefetchId = id }
+            if id != nil {
+                print("[prefetch] started \(id ?? "")")
+            }
+        } catch {
+            print("[prefetch] failed (will fall back on submit): \(error)")
         }
     }
 
@@ -249,6 +278,7 @@ struct FirstSessionView: View {
                     photo: photoData,
                     photoFilename: "photo.jpg",
                     address: address.trimmingCharacters(in: .whitespacesAndNewlines),
+                    prefetchId: prefetchId,
                     progress: { message in
                         loadingMessage = message
                     }

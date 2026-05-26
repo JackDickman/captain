@@ -50,6 +50,61 @@ enum CaptainAPI {
         return resized.jpegData(compressionQuality: jpegQuality) ?? data
     }
 
+    /// POST a photo to /prerender to speculatively start the render
+    /// pipeline as soon as the user picks an image. Returns a prefetch
+    /// id that can later be passed to firstSession() to skip the
+    /// (slowest) render stage. Silent failure on the iOS side — if the
+    /// prerender call errors, firstSession() will fall back to the full
+    /// photo-upload + fresh-render path.
+    static func prerender(photo: Data) async throws -> String? {
+        let url = baseURL.appendingPathComponent("prerender")
+        let boundary = "Boundary-\(UUID().uuidString)"
+        let compressed = compressForUpload(photo)
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.timeoutInterval = 30
+
+        var body = Data()
+        func appendString(_ s: String) {
+            body.append(s.data(using: .utf8)!)
+        }
+        appendString("--\(boundary)\r\n")
+        appendString(
+            "Content-Disposition: form-data; name=\"photo\"; " +
+            "filename=\"photo.jpg\"\r\n"
+        )
+        appendString("Content-Type: image/jpeg\r\n\r\n")
+        body.append(compressed)
+        appendString("\r\n--\(boundary)--\r\n")
+        request.httpBody = body
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.badStatus(code, "prerender failed")
+        }
+        let decoded = try JSONDecoder().decode(
+            PrerenderResponse.self, from: data
+        )
+        // skipped=true in fixture mode; treat as "no prefetch available."
+        return decoded.skipped == true ? nil : decoded.prefetchId
+    }
+
+    private struct PrerenderResponse: Decodable {
+        let prefetchId: String?
+        let skipped: Bool?
+        enum CodingKeys: String, CodingKey {
+            case prefetchId = "prefetch_id"
+            case skipped
+        }
+    }
+
     /// POST a photo + address to /first-session and wait for the result.
     ///
     /// Backend is now async: the POST returns immediately with a `job_id`,
@@ -60,16 +115,22 @@ enum CaptainAPI {
     /// so the loading view can show changing text ("Looking up your home
     /// in public records…" → "Painting a portrait of your home…" etc).
     ///
+    /// When `prefetchId` is provided, the photo upload is skipped — the
+    /// backend reuses the already-saved photo and the in-flight render
+    /// (huge latency win).
+    ///
     /// Fixture mode bypasses polling: the kickoff response carries the
     /// inline `result` and we return it immediately.
     static func firstSession(
         photo: Data,
         photoFilename: String,
         address: String,
+        prefetchId: String? = nil,
         progress: @MainActor @escaping (String) -> Void = { _ in }
     ) async throws -> FirstSessionResponse {
         let kickoff = try await postFirstSessionKickoff(
             photo: photo, photoFilename: photoFilename, address: address,
+            prefetchId: prefetchId,
         )
         if let result = kickoff.result {
             return result
@@ -108,12 +169,16 @@ enum CaptainAPI {
     }
 
     /// Multipart POST kickoff. Returns the kickoff envelope without blocking.
+    ///
+    /// When `prefetchId` is given, the photo upload is omitted — the
+    /// backend reuses the already-saved photo from the prior /prerender
+    /// call. Cuts the upload time on real iPhone photos.
     private static func postFirstSessionKickoff(
         photo: Data, photoFilename: String, address: String,
+        prefetchId: String? = nil,
     ) async throws -> FirstSessionKickoff {
         let url = baseURL.appendingPathComponent("first-session")
         let boundary = "Boundary-\(UUID().uuidString)"
-        let compressed = compressForUpload(photo)
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -131,14 +196,25 @@ enum CaptainAPI {
         appendString("--\(boundary)\r\n")
         appendString("Content-Disposition: form-data; name=\"address\"\r\n\r\n")
         appendString("\(address)\r\n")
-        appendString("--\(boundary)\r\n")
-        appendString(
-            "Content-Disposition: form-data; name=\"photo\"; " +
-            "filename=\"\(photoFilename)\"\r\n"
-        )
-        appendString("Content-Type: image/jpeg\r\n\r\n")
-        body.append(compressed)
-        appendString("\r\n--\(boundary)--\r\n")
+
+        if let prefetchId {
+            appendString("--\(boundary)\r\n")
+            appendString(
+                "Content-Disposition: form-data; name=\"prefetch_id\"\r\n\r\n"
+            )
+            appendString("\(prefetchId)\r\n")
+        } else {
+            let compressed = compressForUpload(photo)
+            appendString("--\(boundary)\r\n")
+            appendString(
+                "Content-Disposition: form-data; name=\"photo\"; " +
+                "filename=\"\(photoFilename)\"\r\n"
+            )
+            appendString("Content-Type: image/jpeg\r\n\r\n")
+            body.append(compressed)
+            appendString("\r\n")
+        }
+        appendString("--\(boundary)--\r\n")
         request.httpBody = body
 
         let (data, response) = try await URLSession.shared.data(for: request)
