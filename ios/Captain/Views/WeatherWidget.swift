@@ -1,9 +1,14 @@
 import SwiftUI
 
-/// Three-day forecast strip on the home screen. Three equal columns —
-/// today + tomorrow + the day after — each with a brass icon, temperature,
-/// and short condition. Quiet card with brass border, matching the MCM
-/// register of the rest of the home view.
+/// Three-day forecast card on the home screen.
+///
+/// Each column is a small stack:
+///   • Day label    (TODAY / TOMORROW / THU)
+///   • Big weather icon
+///   • Temperature  · precip%
+///
+/// Precip is included alongside temperature because yard / exterior decisions
+/// hinge on it as much as on heat. Hidden when NWS didn't quantify it.
 struct WeatherWidget: View {
     let periods: [WeatherPeriod]
 
@@ -17,29 +22,30 @@ struct WeatherWidget: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            ForEach(Array(days.enumerated()), id: \.element.id) { idx, period in
-                if idx > 0 {
-                    // Fixed-height divider so it doesn't stretch the row.
-                    Rectangle()
-                        .fill(CaptainTheme.brass.opacity(0.25))
-                        .frame(width: 1, height: 22)
-                }
-                dayColumn(period: period, index: idx)
-                    .frame(maxWidth: .infinity)
-            }
             if days.isEmpty {
                 Text("weather unavailable")
                     .font(CaptainTheme.body(12))
                     .foregroundStyle(CaptainTheme.textMuted)
                     .frame(maxWidth: .infinity)
+            } else {
+                ForEach(Array(days.enumerated()), id: \.element.id) { idx, period in
+                    if idx > 0 {
+                        Rectangle()
+                            .fill(CaptainTheme.brass.opacity(0.25))
+                            .frame(width: 1)
+                            .padding(.vertical, 12)
+                    }
+                    dayColumn(period: period, index: idx)
+                        .frame(maxWidth: .infinity)
+                }
             }
         }
-        .frame(height: 44)
+        .frame(height: 96)
         .background(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 14)
                 .fill(CaptainTheme.creamDeep.opacity(0.7))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12)
+                    RoundedRectangle(cornerRadius: 14)
                         .strokeBorder(
                             CaptainTheme.brass.opacity(0.35),
                             lineWidth: 1
@@ -48,12 +54,12 @@ struct WeatherWidget: View {
         )
     }
 
-    /// Compact one-row column: day label · icon · temp. Condition text is
-    /// intentionally omitted — the icon carries it, and the row needs to
-    /// stay visually quiet against the rendered home above.
+    /// Column: day label on top, icon centered, then temp + precip on the
+    /// bottom row. Vertically padded so the contents breathe inside the
+    /// taller card.
     @ViewBuilder
     private func dayColumn(period: WeatherPeriod, index: Int) -> some View {
-        HStack(spacing: 8) {
+        VStack(spacing: 6) {
             Text(label(for: period, index: index))
                 .font(CaptainTheme.label(10))
                 .foregroundStyle(CaptainTheme.textMuted)
@@ -61,12 +67,25 @@ struct WeatherWidget: View {
                 .textCase(.uppercase)
                 .lineLimit(1)
             Image(systemName: iconName(for: period.short))
-                .font(.system(size: 15))
+                .font(.system(size: 22))
                 .foregroundStyle(CaptainTheme.brass)
-            Text("\(period.temperature ?? 0)°")
-                .font(CaptainTheme.display(15))
-                .foregroundStyle(CaptainTheme.textPrimary)
+            HStack(spacing: 8) {
+                Text("\(period.temperature ?? 0)°")
+                    .font(CaptainTheme.display(16))
+                    .foregroundStyle(CaptainTheme.textPrimary)
+                if let chance = period.precipChance, chance > 0 {
+                    HStack(spacing: 2) {
+                        Image(systemName: "drop.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(precipColor(chance))
+                        Text("\(chance)%")
+                            .font(CaptainTheme.body(11, weight: .medium))
+                            .foregroundStyle(precipColor(chance))
+                    }
+                }
+            }
         }
+        .padding(.vertical, 10)
         .padding(.horizontal, 4)
     }
 
@@ -89,6 +108,14 @@ struct WeatherWidget: View {
             }
             return period.name
         }
+    }
+
+    /// Brass for low-chance precip (≤20% — a polite footnote), muted blue
+    /// for medium (a real possibility), rust for high (plan around it).
+    private func precipColor(_ chance: Int) -> Color {
+        if chance >= 60 { return CaptainTheme.rust }
+        if chance >= 30 { return CaptainTheme.walnut }
+        return CaptainTheme.textMuted
     }
 
     /// Map NWS short-forecast strings to SF Symbols.
@@ -119,17 +146,20 @@ struct WeatherWidget: View {
     VStack {
         WeatherWidget(periods: [
             WeatherPeriod(name: "This Afternoon", temperature: 71,
-                          unit: "F", short: "Partly Cloudy", isDaytime: true),
+                          unit: "F", short: "Partly Cloudy", isDaytime: true,
+                          precipChance: 10),
             WeatherPeriod(name: "Tonight", temperature: 58,
                           unit: "F", short: "Chance Rain Showers",
-                          isDaytime: false),
+                          isDaytime: false, precipChance: 70),
             WeatherPeriod(name: "Memorial Day", temperature: 71,
                           unit: "F", short: "Areas Of Fog then Partly Sunny",
-                          isDaytime: true),
+                          isDaytime: true, precipChance: 40),
             WeatherPeriod(name: "Monday Night", temperature: 54,
-                          unit: "F", short: "Mostly Cloudy", isDaytime: false),
+                          unit: "F", short: "Mostly Cloudy", isDaytime: false,
+                          precipChance: 30),
             WeatherPeriod(name: "Tuesday", temperature: 80,
-                          unit: "F", short: "Mostly Sunny", isDaytime: true),
+                          unit: "F", short: "Mostly Sunny", isDaytime: true,
+                          precipChance: 0),
         ])
         WeatherWidget(periods: [])
     }

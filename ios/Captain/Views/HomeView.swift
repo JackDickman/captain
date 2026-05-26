@@ -9,20 +9,22 @@ struct HomeView: View {
     @EnvironmentObject var appState: AppState
     @State private var chatPresented = false
     @State private var profilePresented = false
+    @State private var radarPresented = false
     @State private var weatherPeriods: [WeatherPeriod] = []
+    @State private var radar: RadarResponse?
+    @State private var radarLoading = true
 
-    private var accent: Color {
-        Color(hex: session.palette.first ?? "#7a6750")
-    }
+    /// Second swatch from the home's extracted palette, used as the warm
+    /// top-of-screen gradient. First swatch isn't read directly — the
+    /// brass picture frame already carries the dominant accent.
     private var accent2: Color {
         Color(hex: session.palette.dropFirst().first ?? "#d8b486")
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             background
             content
-            chatBar
         }
         .fullScreenCover(isPresented: $chatPresented) {
             ChatView(session: session)
@@ -30,7 +32,13 @@ struct HomeView: View {
         .sheet(isPresented: $profilePresented) {
             ProfileView(session: session)
         }
+        .sheet(isPresented: $radarPresented) {
+            if let radar {
+                RadarView(radar: radar)
+            }
+        }
         .task { await loadWeather() }
+        .task { await loadRadar() }
         .onAppear {
             let args = ProcessInfo.processInfo.arguments
             // Debug: launch with --auto-chat / --show-profile to open the
@@ -54,6 +62,14 @@ struct HomeView: View {
         }
     }
 
+    private func loadRadar() async {
+        radarLoading = true
+        defer { radarLoading = false }
+        if let result = try? await CaptainAPI.fetchRadar() {
+            radar = result
+        }
+    }
+
     // MARK: - Background
 
     private var background: some View {
@@ -74,12 +90,23 @@ struct HomeView: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 0) {
             topBlock
-            Spacer().frame(height: 22)
-            heroImage
             Spacer().frame(height: 18)
+            heroImage
+            Spacer().frame(height: 14)
             WeatherWidget(periods: weatherPeriods)
                 .padding(.horizontal, 24)
-            Spacer()
+            Spacer().frame(height: 10)
+            RadarStrip(radar: radar, isLoading: radarLoading) {
+                if radar != nil { radarPresented = true }
+            }
+            .padding(.horizontal, 24)
+            Spacer(minLength: 12)
+            // Bottom chat capsule sits inline in the column now (no walnut
+            // surface beneath it) — the cream background runs unbroken
+            // from the home image all the way to the safe area.
+            chatCapsule
+                .padding(.horizontal, 20)
+                .padding(.bottom, 12)
         }
     }
 
@@ -188,50 +215,41 @@ struct HomeView: View {
         .padding(.horizontal, 24)
     }
 
-    // MARK: - Chat bar (walnut surface)
+    // MARK: - Chat capsule
 
-    private var chatBar: some View {
-        VStack(spacing: 0) {
-            ZStack(alignment: .bottom) {
-                CaptainTheme.walnut
-                VStack(spacing: 12) {
-                    Capsule()
-                        .fill(CaptainTheme.brass.opacity(0.8))
-                        .frame(width: 38, height: 4)
-                        .padding(.top, 12)
-                    Button {
-                        chatPresented = true
-                    } label: {
-                        HStack(spacing: 12) {
-                            Text("ask about your home…")
-                                .font(CaptainTheme.body(15))
-                                .foregroundStyle(.white.opacity(0.92))
-                            Spacer()
-                            Image(systemName: "camera.fill")
-                                .font(.system(size: 16))
-                                .foregroundStyle(CaptainTheme.brassBright)
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 14)
-                        .background(
-                            Capsule()
-                                .fill(.white.opacity(0.08))
-                                .overlay(
-                                    Capsule()
-                                        .strokeBorder(
-                                            CaptainTheme.brass.opacity(0.45),
-                                            lineWidth: 1
-                                        )
-                                )
-                        )
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 26)
-                    }
-                    .buttonStyle(.plain)
-                }
+    /// Floating chat input on the cream background. Walnut fill + brass
+    /// border give it the "cabinetry" warmth the old full-width walnut
+    /// strip carried, but now contained to the capsule itself so the
+    /// background runs unbroken through the home screen.
+    private var chatCapsule: some View {
+        Button {
+            chatPresented = true
+        } label: {
+            HStack(spacing: 12) {
+                Text("ask about your home…")
+                    .font(CaptainTheme.body(15))
+                    .foregroundStyle(.white.opacity(0.92))
+                Spacer()
+                Image(systemName: "camera.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(CaptainTheme.brassBright)
             }
-            .frame(height: 130)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            .background(
+                Capsule()
+                    .fill(CaptainTheme.walnut)
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(
+                                CaptainTheme.brass.opacity(0.6),
+                                lineWidth: 1
+                            )
+                    )
+            )
+            .mcmShadow(intensity: 0.8)
         }
+        .buttonStyle(.plain)
     }
 }
 

@@ -73,6 +73,12 @@ def get_forecast_structured(lat: float, lng: float,
                 "unit": p.get("temperatureUnit", "F"),
                 "short": p.get("shortForecast", ""),
                 "isDaytime": p.get("isDaytime", True),
+                # NWS shape: {"unitCode": "wmoUnit:percent", "value": int|null}.
+                # Null = forecaster didn't quantify precip for this period;
+                # iOS surfaces only when we have a real number.
+                "precipChance": (
+                    (p.get("probabilityOfPrecipitation") or {}).get("value")
+                ),
             }
             for p in periods
         ]
