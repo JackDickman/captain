@@ -431,6 +431,27 @@ def first_session_status(job_id: str) -> dict:
 
 # ---------- Chat ----------
 
+def _send_canned_chat_reply(
+    home_id: int, user_message: str, photo_urls: list[str],
+    canned_text: str,
+) -> dict:
+    """Persist the user message + a canned assistant reply, and skip the
+    background memory update. Used for messages the scope gate flagged as
+    off-topic or out-of-capability — those aren't real home conversations,
+    so we don't want them poisoning the home/owner profile rewrite."""
+    conv_id = store.get_or_create_conversation(home_id)
+    store.add_message(
+        conv_id, "user", user_message,
+        image_urls=photo_urls if photo_urls else None,
+    )
+    msg_id = store.add_message(conv_id, "assistant", canned_text)
+    return {
+        "message_id": msg_id,
+        "response": canned_text,
+        "image_urls": photo_urls,
+    }
+
+
 def _ensure_home_for_chat() -> int:
     """Chat needs a home to be persisted (via first-session). If none yet,
     seed from the dev fixture so iOS can exercise chat without first running
@@ -528,6 +549,27 @@ async def chat(
 
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(500, "OPENAI_API_KEY missing on backend")
+
+    # Scope gate. Classify text-bearing messages with ≥2 words; skip the
+    # gate for photo-only sends (likely a home photo the user wants
+    # Captain to look at) and for very short continuations ("yes",
+    # "ok") where the classifier is more noise than signal.
+    scope = "in_scope"
+    if user_message and len(user_message.split()) >= 2:
+        scope, reason = chat_mod.classify_message_scope(user_message)
+        if scope != "in_scope":
+            print(f"[scope] {scope}: {reason}")
+
+    if scope == "off_topic":
+        return _send_canned_chat_reply(
+            home_id, user_message, photo_urls,
+            chat_mod.OFF_TOPIC_REPLY,
+        )
+    if scope == "out_of_capability":
+        return _send_canned_chat_reply(
+            home_id, user_message, photo_urls,
+            chat_mod.OUT_OF_CAPABILITY_REPLY,
+        )
 
     try:
         assistant_text = chat_mod.respond_to_message(

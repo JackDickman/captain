@@ -37,6 +37,9 @@ from . import profiles, radar, store
 CHAT_MODEL = os.getenv("CAPTAIN_CHAT_MODEL", "gpt-5.4-mini")
 # Calendar extraction is simple structured JSON; nano is plenty.
 CALENDAR_MODEL = os.getenv("CAPTAIN_CALENDAR_MODEL", "gpt-5.4-nano")
+# Scope gate runs on every text message before the main chat call.
+# Nano-class — a yes/no/yes-but classifier, not a reasoning task.
+SCOPE_MODEL = os.getenv("CAPTAIN_SCOPE_MODEL", "gpt-5.4-nano")
 
 # Hardcoded for v1. When iOS sends a real address, first-session should
 # geocode and persist lat/lng to home row.
@@ -74,6 +77,112 @@ CALENDAR_SCHEMA = {
     "required": ["new_calendar_entries"],
     "additionalProperties": False,
 }
+
+
+# ---------- Scope gate ----------
+
+SCOPE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scope": {
+            "type": "string",
+            "enum": ["in_scope", "off_topic", "out_of_capability"],
+        },
+        "reason": {
+            "type": "string",
+            "description": "One short sentence; for server logs only.",
+        },
+    },
+    "required": ["scope", "reason"],
+    "additionalProperties": False,
+}
+
+# Canned replies for the two gated cases. Tone-matched to Captain
+# (quiet, observant, gently redirecting — never a chatbot guardrail).
+OFF_TOPIC_REPLY = (
+    "That's a bit outside my lane — I stay close to your home and the "
+    "work of keeping it up. Happy to dig into anything about the house, "
+    "the yard, household routines, vendors, or how the weather's "
+    "affecting things."
+)
+
+OUT_OF_CAPABILITY_REPLY = (
+    "I can talk that through with you, but I can't do it myself — I "
+    "can't generate images, send messages, browse the live web, or "
+    "take actions out in the world. If you want to think through the "
+    "decision or what your next step is, I'm here for that."
+)
+
+
+def classify_message_scope(user_message: str) -> tuple[str, str]:
+    """Cheap pre-flight on an incoming chat message. Returns (scope, reason).
+
+    scope:
+      - "in_scope": anything about the home, its care, household life
+        related to the home, vendor decisions, the owner's preferences,
+        or normal small-talk continuation in that thread. DEFAULT —
+        lean lenient.
+      - "off_topic": clearly not about the home or homeownership —
+        homework help, coding questions, dating, sports debates,
+        unrelated work problems, current events, etc.
+      - "out_of_capability": asks Captain to DO something it can't —
+        generate images, send emails / messages, browse the live web,
+        control smart devices, place orders, take actions in the world.
+
+    `reason` is captured for server logs only; iOS sees only the canned
+    user-facing reply for the gated cases.
+
+    Soft-fails open: on any classifier exception, we return in_scope so
+    a flaky model never blocks a real user.
+    """
+    sys_prompt = (
+        "You are a fast topic + capability gate for Captain, an AI helper "
+        "dedicated to a single homeowner and their specific home. Captain "
+        "helps with: home maintenance, repairs, landscaping, decor, "
+        "vendors, seasonal upkeep, neighborhood context, household "
+        "routines, weather-aware decisions, and anything else where the "
+        "user's home or life-as-a-homeowner is the subject.\n\n"
+        "Captain CAN reason and converse but CANNOT: generate images, "
+        "send messages or emails on the user's behalf, browse the live "
+        "web, control smart devices or appliances, place orders, schedule "
+        "appointments, or take any other actions out in the world.\n\n"
+        "Classify the user's message into exactly one of:\n"
+        "  - in_scope: about the home, its care, owner's home life, or "
+        "    a continuation/small-talk in that thread.\n"
+        "  - off_topic: clearly not about the home — homework, code, "
+        "    dating, sports trivia, unrelated work problems, etc.\n"
+        "  - out_of_capability: asking Captain to DO something it can't.\n\n"
+        "LEAN GENEROUS on in_scope. Short answers, feelings about the "
+        "house, tangents that touch home life, vague questions where home "
+        "context is plausible — all in_scope. Mark off_topic only when "
+        "the message has nothing to do with the user's home or life in "
+        "it. Mark out_of_capability only when the user is asking Captain "
+        "to PERFORM an action it can't, not just discuss it.\n\n"
+        f"Message: {user_message}"
+    )
+
+    try:
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model=SCOPE_MODEL,
+            messages=[{"role": "system", "content": sys_prompt}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "scope_check",
+                    "schema": SCOPE_SCHEMA,
+                    "strict": True,
+                },
+            },
+        )
+        payload = json.loads(resp.choices[0].message.content)
+        return (
+            payload.get("scope", "in_scope"),
+            payload.get("reason", ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[scope] classifier failed (accepting message): {e}")
+        return "in_scope", ""
 
 
 def _build_system_prompt(home: dict, calendar: list[dict],
