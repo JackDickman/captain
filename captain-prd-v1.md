@@ -1,6 +1,6 @@
 # Captain — Product Requirements Document (v1)
 
-**Version:** 1.0
+**Version:** 1.1
 **Last updated:** May 26, 2026
 **Status:** Draft — personal pet project, under active build
 
@@ -99,6 +99,10 @@ Captain then presents what it thinks it knows and lets the user confirm or corre
 
 The same photo also drives **UI customization**: the app's color palette, accent imagery, and home-screen visual are derived from the photo so the app feels like *theirs* from the first session. This is the first "aha" moment of the product.
 
+**Setup validation.** Before kicking off the (~30-second) extraction + rendering pipeline, a quick stage-0 check geocodes the address (US Census) and runs a small vision classifier over the photo to confirm it's actually a residential home exterior. Bad input (made-up address, indoor selfie, floor-plan screenshot) gets a specific friendly error inline so the user can correct and resubmit without burning the long pipeline. The classifier is lenient — only catches clear mismatches; soft-fails open on its own errors so it never blocks a real user.
+
+**Speculative pre-render.** The current-season home rendering — the slowest stage by far — is kicked off the moment the user picks their photo in the form, in parallel with them typing the address. By the time they tap submit, the render is usually mostly or fully done, and the loading screen often only covers the remaining ~15s of search + extraction + finalization instead of the full ~45s.
+
 ### 6.2 Optional "I just moved in" mode
 
 After the first-session photo flow, new owners can opt into a guided setup workflow — a scavenger hunt through the house, structured as a checklist of items to find and photograph. Captain prompts the user to find and photograph things like:
@@ -145,15 +149,21 @@ Chat is the workhorse but not the front door. The home screen is the home.
 
 Every chat photo also enriches the home profile and may produce a calendar entry as a side effect.
 
+**Photo input — library or camera.** The chat input's brass camera button opens a quick menu: pick from the photo library (multi-select, ordered) or take a photo in-app right now. Captures and library picks stack into a single pending strip so a user can mix sources within one message. Both flows hit the same vision extraction pipeline.
+
 Captain's chat behavior:
 
 - Speaks in plain language, defines jargon inline unless the personal profile signals expertise
 - Asks clarifying questions when useful, not reflexively
-- Uses web search when current or local information matters
 - Helps the user *decide* what to do and *who* to call — including reading reviews and surfacing options — rather than just dumping search results
 - Quietly updates the home profile, personal profile, and calendar as a side effect of conversation
 - **Draws out durable details.** When a conversation naturally surfaces a specific the user will want a year from now — bags of mulch used, paint brand, plant counts, filter size, vendor name — Captain asks one short follow-up at the *end* of its response. Help first, ask second. One question per turn. Never asks about prices or costs (no financial surfaces per §10).
 - **Stays in its lane.** A lightweight scope gate runs before each chat turn. Off-topic messages (homework help, coding, dating, etc.) and capability-overreach asks (generate an image, send an email, place an order) get a quiet redirect rather than a long answer. Lenient by default; only catches clear cases.
+
+**Two tools the chat model can reach for, deciding on its own when each fits:**
+
+- **`web_search`** — live web lookup via Firecrawl. Used when the user's question genuinely requires current or local information the model can't be confident of from training: current contractor reviews in the user's area, recent regulatory or rebate changes, current local conditions where the home-screen weather context isn't enough. iOS shows a live "searching the web for X" indicator on the assistant bubble while the search is in flight so the user can see what's being looked up. Empty / failed searches surface plainly ("couldn't find live info on that") and Captain proceeds with what it knows — never fabricates sources.
+- **`find_products`** — product recommendations via Firecrawl scoped to Amazon. Used when the conversation surfaces a concrete product the user might want to order (restocking a filter, picking up a stain, finding a pet-safe lawn product). The pattern is offered, never pushed — "want me to pull up a few options?". Single recommendations render inline as a markdown link in Captain's prose; comparisons of 2-3 picks render as compact cards under the bubble that tap through to the affiliate URL. The model is told never to mention price in prose (PRD §5). Re-recommends brands the user has used before when the profile carries that context. See §11.8 for the business-model framing this enables.
 
 ### 6.6 Home screen
 
@@ -360,7 +370,7 @@ These tradeoffs are acceptable for a pet-project v1 and worth revisiting if the 
 
 ### 9.4 Deferred to post-v1
 
-- **Amazon Product Advertising API / affiliate links.** The first monetization lever, but not needed for a personal-use v1. Will require an affiliate account and dealing with the Amazon API's quirks when the time comes.
+- **Amazon Product Advertising API.** v1 reaches Amazon via Firecrawl-scoped web search and Amazon Associates affiliate links (§6.5 `find_products` + §11.8). The full PA-API gives richer structured data (price, ratings, stock) but isn't required for the v1 product-card flow.
 - **External calendar integration.** No syncing reminders to Google Calendar or Apple Calendar in v1. Captain's internal calendar is the only one.
 - **Zillow, Redfin, Realtor.com, or other valuation APIs.** Mostly locked to licensed real estate professionals and not aligned with v1's "no financial stress surfaces" principle anyway.
 - **Dedicated reviews APIs (Yelp Fusion, Google Maps reviews).** Web search returning review-rich pages should be enough for v1's "who do I call" use case.
@@ -414,7 +424,11 @@ A panic-flow for "water is coming through the ceiling" situations — shutoff gu
 
 ### 11.8 Business model
 
-Affiliate links (Amazon, etc.) covered in chat are the v1 default — modest revenue, low intrusion. Real monetization decisions (subscription, lead gen, etc.) deferred until product-market signal is clear. The choice will shape the product, so worth picking deliberately when the time comes.
+Affiliate links (Amazon, etc.) covered in chat are the v1 default — modest revenue, low intrusion. The Amazon flow is wired in v1: the chat model can invoke `find_products` (see §6.5) and Captain wraps the returned URLs with our Amazon Associates tag (`CAPTAIN_AMAZON_TAG`). Links work without an affiliate account configured — they just don't earn — so the feature runs end-to-end in dev. FTC disclosure ("Captain earns from qualifying purchases.") renders as a quiet footer below product cards.
+
+Multi-retailer (Home Depot, Lowe's, Walmart, Target) is structured but not wired — each `ProductPick` already carries a `retailer` field, and each retailer needs its own affiliate-network signup (Impact Radius, Rakuten) and URL-builder. Adding one is small.
+
+Real monetization decisions beyond affiliate (subscription, lead gen, etc.) deferred until product-market signal is clear. The choice will shape the product, so worth picking deliberately when the time comes.
 
 ### 11.9 "What would it look like…" — user-driven home visualizations
 
