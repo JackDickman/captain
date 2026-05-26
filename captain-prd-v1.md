@@ -416,6 +416,24 @@ A panic-flow for "water is coming through the ceiling" situations — shutoff gu
 
 Affiliate links (Amazon, etc.) covered in chat are the v1 default — modest revenue, low intrusion. Real monetization decisions (subscription, lead gen, etc.) deferred until product-market signal is clear. The choice will shape the product, so worth picking deliberately when the time comes.
 
+### 11.9 "What would it look like…" — user-driven home visualizations
+
+The same rendering pipeline that powers the home portrait could let the user *try things on*. The owner asks (in chat, with a photo, or from a profile field) and Captain produces a fresh rendering of their home with the change applied — a pool in the backyard, the front door painted navy, a flagstone walkway replacing the concrete, the panicle hydrangeas in front of the porch instead of the boxwoods, a pergola off the deck. The rendered home is already the emotional anchor of the app; turning it into a *what-if* canvas extends that anchor into the planning phase of homeownership and makes Captain the place you go to *imagine* changes, not just track them.
+
+Why this fits Captain (and not any random AI image tool):
+
+- Captain already knows the home — proportions, materials, palette, landscaping, style — so the generated variant can preserve the home's identity in a way generic prompts can't.
+- It pairs naturally with the existing "decide what to do" judgment layer in chat: see the change, then talk through cost ranges, vendors, seasonal timing, what to ask for in a quote, etc.
+- It pairs naturally with `find_products` (the affiliate flow): a paint color the user likes in the rendering links to that paint at a retailer; a pool render leads into the contractor conversation.
+- It pairs naturally with the calendar / passport: a saved visualization becomes a forward-dated entry ("planning to repaint the front door navy"), and later, after the work is done, the same visualization sits next to the after-photo as part of the home's story.
+
+Open questions worth a real prototype before committing:
+
+- How much can the model be pushed before the home's identity slips? Small swaps (door color, plant choice) are likely safe; large additions (a pool, a dormer) may drift the architecture in ways that break the illusion.
+- Should this generate one rendering or a small set the user can compare?
+- Should saved visualizations be public-ish (e.g., shareable with a spouse or a contractor as part of a quote-request) or strictly private?
+- Pricing/cost framing: the PRD's "no financial stress surfaces" rule (§5) probably means the rendering itself never quotes a dollar figure, but the conversation around it can still help the user think about what to budget for.
+
 ## 12. Open questions
 
 Things still genuinely unresolved and worth thinking about further.
