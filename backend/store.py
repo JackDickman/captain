@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     image_url TEXT,               -- legacy single-photo field (kept for old rows)
     image_urls TEXT,              -- JSON array of relative URLs for attached photos
+    product_picks TEXT,           -- JSON array of product cards (assistant-side only)
     created_at REAL NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
 );
@@ -107,6 +108,7 @@ def init_db() -> None:
         for ddl in [
             "ALTER TABLE messages ADD COLUMN image_url TEXT",
             "ALTER TABLE messages ADD COLUMN image_urls TEXT",
+            "ALTER TABLE messages ADD COLUMN product_picks TEXT",
         ]:
             try:
                 c.execute(ddl)
@@ -296,9 +298,10 @@ def get_or_create_conversation(home_id: int) -> int:
 
 
 def _hydrate_message_row(r: sqlite3.Row) -> dict:
-    """Convert a messages row to the shape iOS expects. Specifically: surface
-    `image_urls` as a real list of strings, merging in the legacy single
-    `image_url` if present so old rows still display correctly."""
+    """Convert a messages row to the shape iOS expects. Specifically:
+    surface `image_urls` and `product_picks` as real lists, merging in
+    the legacy single `image_url` if present so old rows still display
+    correctly."""
     d = dict(r)
     urls_json = d.pop("image_urls", None)
     legacy_url = d.pop("image_url", None)
@@ -313,20 +316,35 @@ def _hydrate_message_row(r: sqlite3.Row) -> dict:
     if not urls and legacy_url:
         urls = [legacy_url]
     d["image_urls"] = urls
+
+    picks_json = d.pop("product_picks", None)
+    picks: list[dict] = []
+    if picks_json:
+        try:
+            decoded = json.loads(picks_json)
+            if isinstance(decoded, list):
+                picks = [p for p in decoded if isinstance(p, dict)]
+        except json.JSONDecodeError:
+            pass
+    d["product_picks"] = picks
     return d
 
 
 def add_message(
     conversation_id: int, role: str, content: str,
     image_urls: list[str] | None = None,
+    product_picks: list[dict] | None = None,
 ) -> int:
     urls_json = json.dumps(image_urls) if image_urls else None
+    picks_json = json.dumps(product_picks) if product_picks else None
     with connect() as c:
         cur = c.execute(
             """INSERT INTO messages
-                 (conversation_id, role, content, image_urls, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (conversation_id, role, content, urls_json, time.time()),
+                 (conversation_id, role, content,
+                  image_urls, product_picks, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (conversation_id, role, content,
+             urls_json, picks_json, time.time()),
         )
         return cur.lastrowid
 
@@ -335,7 +353,8 @@ def get_recent_messages(conversation_id: int, limit: int = 20) -> list[dict]:
     """Returns most-recent `limit` messages, oldest-first."""
     with connect() as c:
         rows = c.execute(
-            """SELECT id, role, content, image_url, image_urls, created_at
+            """SELECT id, role, content, image_url, image_urls,
+                      product_picks, created_at
                FROM messages WHERE conversation_id = ?
                ORDER BY id DESC LIMIT ?""",
             (conversation_id, limit),
@@ -347,7 +366,8 @@ def get_all_messages(conversation_id: int) -> list[dict]:
     """All messages, oldest-first. Used by iOS to hydrate the chat view."""
     with connect() as c:
         rows = c.execute(
-            """SELECT id, role, content, image_url, image_urls, created_at
+            """SELECT id, role, content, image_url, image_urls,
+                      product_picks, created_at
                FROM messages WHERE conversation_id = ?
                ORDER BY id""",
             (conversation_id,),

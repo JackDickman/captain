@@ -1,5 +1,23 @@
 import Foundation
 
+/// One product Captain recommends in chat. Attached to an assistant
+/// message when the model invokes `find_products` with num_options >= 2
+/// (the user sees these as compact cards under the bubble text). When
+/// num_options == 1, the link is embedded inline in the prose instead
+/// and no ProductPick is created.
+struct ProductPick: Codable, Equatable, Hashable {
+    /// Display title of the product (typically the Amazon listing title).
+    let title: String
+    /// Where to buy. v1 is "Amazon"; structure leaves room for Home
+    /// Depot / Lowe's / etc. without breaking the wire format.
+    let retailer: String
+    /// Affiliate-tagged URL the user opens. Captain wraps Amazon URLs
+    /// with the configured affiliate tag server-side.
+    let url: String
+    /// Short blurb extracted from the listing — shown on the card.
+    let blurb: String
+}
+
 /// One message in the chat. Mirrors the row in backend's `messages` table.
 struct ChatMessage: Codable, Equatable, Identifiable, Hashable {
     let id: Int
@@ -8,6 +26,10 @@ struct ChatMessage: Codable, Equatable, Identifiable, Hashable {
     /// Server-relative URLs of any attached photos. Empty (or omitted) for
     /// text-only messages. Order matches the order the user attached them.
     let imageUrls: [String]?
+    /// Product cards Captain attached to an assistant message via the
+    /// find_products tool. Empty / nil on user messages and on assistant
+    /// messages where the model chose num_options=1 (embedded inline).
+    let productPicks: [ProductPick]?
     let createdAt: Double
 
     enum Role: String, Codable {
@@ -18,6 +40,7 @@ struct ChatMessage: Codable, Equatable, Identifiable, Hashable {
     enum CodingKeys: String, CodingKey {
         case id, role, content
         case imageUrls = "image_urls"
+        case productPicks = "product_picks"
         case createdAt = "created_at"
     }
 }
@@ -35,6 +58,11 @@ struct ChatResponse: Codable {
     /// show a "🌐 searched the web for X" footer on the assistant bubble
     /// so the user can see what was looked up.
     let searches: [String]?
+    /// Product cards Captain attached this turn. Same data as
+    /// ChatMessage.productPicks — duplicated here for the optimistic
+    /// path so cards can render the instant the response arrives,
+    /// before the full message history refetch.
+    let productPicks: [ProductPick]?
 
     enum CodingKeys: String, CodingKey {
         case messageId = "message_id"
@@ -42,6 +70,7 @@ struct ChatResponse: Codable {
         case imageUrls = "image_urls"
         case fixture
         case searches
+        case productPicks = "product_picks"
     }
 }
 

@@ -240,9 +240,17 @@ When you respond:
   - Keep responses concise unless the question genuinely warrants depth. Long lectures break the conversation.
 
 Real-time web search (the `web_search` tool):
-  You have access to a live web search tool. Use it when, and only when, the user's question genuinely requires current or local information that you can't be confident of from training alone — current product prices/specs, current contractor reviews or recommendations in their specific area, recent regulatory or rebate changes, current local conditions where the weather context above isn't enough, or anything where "right now" matters.
+  You have access to a live web search tool. Use it when, and only when, the user's question genuinely requires current or local information that you can't be confident of from training alone — current contractor reviews or recommendations in their specific area, recent regulatory or rebate changes, current local conditions where the weather context above isn't enough, or anything where "right now" matters.
   Do NOT search for general home-care advice that doesn't depend on current info (how to caulk a tub, what mulch type to use, when to prune a hydrangea, what a P-trap is). Do NOT search for things you already know from the profiles. Prefer one concise, specific query (include city/state when local results matter) over multiple speculative ones.
   When results are weak or empty, just say so plainly and answer with what you do know — never pretend to have found something useful.
+
+Product recommendations (the `find_products` tool):
+  When the conversation surfaces a concrete product the user might want to order — restocking an HVAC filter, buying a specific paint or stain, picking up a tool for a job, finding a pet-safe lawn product — use the `find_products` tool to pull live Amazon picks the user can tap straight through to.
+  The pattern is offered, never pushed: "Want me to pull up a few options?" — matching how you'd offer to find a contractor. Only call the tool after the user signals shopping intent, or after you've offered and they've said yes. Don't tool-call on the first turn of a topic just because a product is mentioned in passing.
+  `num_options=1` when you have a single specific recommendation in mind (you'll embed the link inline in your prose with a markdown link). `num_options=2` or `3` when you're offering a small set to compare (cards render below your text — keep your text short and conversational; don't enumerate the picks in prose).
+  Re-recommend brands the user has used before when the profile tells you what they bought — this is one of the best moments to call the tool ("same Honeywell pack you bought last fall").
+  NEVER mention price in your prose. The user sees the price when they tap through. Captain stays calm and out of the cost conversation (PRD §5).
+  When the tool returns empty / unhelpful, say so plainly and suggest a brand the user could look up themselves — don't fabricate links.
 
 Drawing out durable details (the biographer's instinct):
   Part of your job is to capture specifics the owner will be glad to have a year from now. When a conversation naturally touches a moment where a concrete number, brand, vendor, or measurement would be useful later, ask one quiet follow-up — at the END of your response, after you've actually helped — to surface it. Examples:
@@ -303,9 +311,72 @@ WEB_SEARCH_TOOL = {
     },
 }
 
+# OpenAI tool definition for the `find_products` function. The model
+# invokes this when the conversation surfaces a product the user might
+# want to buy. Returns 1 or 2-3 picks — the model picks the count based
+# on whether it's a single recommendation (mention inline) or a small
+# comparison (renders as cards in iOS).
+FIND_PRODUCTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "find_products",
+        "description": (
+            "Find specific products to recommend to the homeowner. USE "
+            "THIS when the conversation surfaces a concrete product need "
+            "the user might want to order — an HVAC filter to reorder, a "
+            "specific paint or stain to buy, a tool for a job, a pet-safe "
+            "lawn product, etc. Especially good for restocking something "
+            "they've used before (their profile may name the brand). DO "
+            "NOT use for service or contractor recommendations (use "
+            "web_search for those), and DO NOT use for general advice "
+            "where no purchase is implied. ALWAYS frame Captain's pitch "
+            "as 'want me to pull up a few options?' — offered, never "
+            "pushed. `num_options=1` means you'll mention one specific "
+            "pick inline as a markdown link in your prose; "
+            "`num_options=2` or `3` means a small set of options will "
+            "render as compact cards below your text — keep your text "
+            "short and conversational in that case."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Concrete product search query. Be specific — "
+                        "include the brand, size, type, MERV rating, "
+                        "color, etc. that the conversation suggests."
+                    ),
+                },
+                "num_options": {
+                    "type": "integer",
+                    "description": (
+                        "1 if you're recommending one specific pick "
+                        "(you'll embed the link inline in prose). "
+                        "2 or 3 if you're offering options to compare "
+                        "(cards will render below your text)."
+                    ),
+                    "minimum": 1,
+                    "maximum": 3,
+                },
+                "reason_hint": {
+                    "type": "string",
+                    "description": (
+                        "One short sentence (under 12 words) you'd "
+                        "show to the user about why this category fits. "
+                        "Shown on the cards. Skip when num_options=1."
+                    ),
+                },
+            },
+            "required": ["query", "num_options"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 # Hard cap on tool-call rounds per chat turn so a confused model can't
 # rack up cost by re-searching repeatedly. After this many rounds the
-# tool is no longer offered and the model must answer with what it has.
+# tools are no longer offered and the model must answer with what it has.
 MAX_TOOL_ROUNDS = 2
 
 
@@ -366,6 +437,140 @@ def _do_web_search(query: str) -> str:
         excerpt = content[:1500].strip()
         blocks.append(f"[{i}] {title}\n{url}\n{excerpt}")
     return "\n\n---\n\n".join(blocks)
+
+
+def _affiliate_url(url: str) -> str:
+    """Wrap an Amazon product URL with our affiliate tag (when set).
+
+    Idempotent: if the URL already carries a `tag=` param we leave it
+    alone. If `CAPTAIN_AMAZON_TAG` isn't configured, the URL is returned
+    unchanged — the link still works, just without earning revenue. Lets
+    the feature run end-to-end in dev without an affiliate account."""
+    tag = os.getenv("CAPTAIN_AMAZON_TAG")
+    if not tag:
+        return url
+    if "amazon." not in url:
+        return url
+    if "tag=" in url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}tag={tag}"
+
+
+def _find_products(query: str, num_options: int) -> tuple[str, list[dict]]:
+    """Run an Amazon-scoped product search via Firecrawl, normalize the
+    results into structured product picks, and return (text_for_model,
+    structured_picks).
+
+    `text_for_model` is what gets fed back to the LLM as the tool
+    result — concise, just enough for the model to embed a link in
+    prose (num_options=1) or write a short intro (num_options>=2).
+
+    `structured_picks` is the list iOS will render as compact product
+    cards. Empty when num_options==1 (the model handles that case
+    inline) OR when the search yielded nothing.
+    """
+    api_key = os.getenv("FIRECRAWL_API_KEY")
+    if not api_key:
+        return (
+            "Product search is unavailable right now (no API key). "
+            "Suggest a brand the user could look up themselves and "
+            "acknowledge you couldn't pull links.",
+            [],
+        )
+
+    try:
+        from first_session import firecrawl_search
+        # site:amazon.com keeps results constrained to product pages we
+        # can affiliate-tag. Firecrawl's search supports the operator.
+        results = firecrawl_search(api_key, f"site:amazon.com {query}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[find_products] firecrawl error: {e}")
+        return (
+            f"Product search failed: {type(e).__name__}. Suggest a "
+            "brand the user could look up themselves and acknowledge "
+            "you couldn't pull links.",
+            [],
+        )
+
+    # Filter to actual Amazon product URLs only (Firecrawl can return
+    # category / search pages too; we want individual products so a tap
+    # lands on something orderable).
+    amazon_products: list[dict] = []
+    for r in results:
+        url = (
+            r.get("url")
+            or (r.get("metadata") or {}).get("sourceURL")
+            or ""
+        )
+        if "amazon." not in url:
+            continue
+        if "/dp/" not in url and "/gp/product/" not in url:
+            # Search-result or category pages; skip — not orderable.
+            continue
+        amazon_products.append({
+            "title": (r.get("title") or "").strip(),
+            "url": _affiliate_url(url),
+            "description": (
+                r.get("description") or r.get("snippet") or ""
+            )[:200].strip(),
+        })
+        if len(amazon_products) >= max(num_options, 3):
+            break
+
+    if not amazon_products:
+        return (
+            "No clean Amazon product results were returned. Suggest a "
+            "brand or category the user could look up themselves and "
+            "acknowledge you couldn't pull links.",
+            [],
+        )
+
+    picks = amazon_products[:num_options]
+
+    # Compose the model-facing text. For num_options==1 we want the
+    # model to weave the link inline, so we give it title + URL plainly.
+    # For >=2 we tell the model not to enumerate in prose (cards do
+    # that) and just write a short conversational intro.
+    if num_options == 1:
+        p = picks[0]
+        text_for_model = (
+            f"One product to recommend (embed as a markdown link in "
+            f"your prose):\n\n"
+            f"Title: {p['title']}\n"
+            f"URL: {p['url']}\n"
+            f"Blurb: {p['description']}"
+        )
+        # num_options==1 → no structured cards (model does it inline).
+        return text_for_model, []
+
+    bullet_lines = []
+    for i, p in enumerate(picks, start=1):
+        bullet_lines.append(
+            f"  {i}. {p['title']} — {p['description']}"
+        )
+    text_for_model = (
+        "Product options to compare. DO NOT list them in your prose — "
+        "the cards render automatically below your response. Just "
+        "write a short conversational intro (e.g. 'A few worth "
+        "comparing — the first matches your existing setup, the "
+        "second's a tier up') and let the cards do the work.\n\n"
+        + "\n".join(bullet_lines)
+    )
+
+    # Structured picks for iOS to render as cards. Each pick gets a
+    # `retailer` field so we can extend to multi-retailer later without
+    # iOS schema churn.
+    structured = [
+        {
+            "title": p["title"],
+            "retailer": "Amazon",
+            "url": p["url"],
+            "blurb": p["description"],
+        }
+        for p in picks
+    ]
+    return text_for_model, structured
 
 
 def _image_part(path: Path) -> dict:
@@ -438,10 +643,11 @@ def respond_to_message(
 
     client = OpenAI()
     searches: list[str] = []
+    product_picks: list[dict] = []
     assistant_text = ""
 
     # Tool-calling loop: keep calling the model until it stops invoking
-    # tools, or until we hit the round cap. After the cap the tool is
+    # tools, or until we hit the round cap. After the cap the tools are
     # removed from the request so the model has to commit to a final
     # answer with whatever it has.
     if on_stage:
@@ -449,7 +655,8 @@ def respond_to_message(
 
     for round_idx in range(MAX_TOOL_ROUNDS + 1):
         tools = (
-            [WEB_SEARCH_TOOL] if round_idx < MAX_TOOL_ROUNDS else None
+            [WEB_SEARCH_TOOL, FIND_PRODUCTS_TOOL]
+            if round_idx < MAX_TOOL_ROUNDS else None
         )
         resp = client.chat.completions.create(
             model=CHAT_MODEL,
@@ -483,15 +690,15 @@ def respond_to_message(
             ],
         })
 
-        # Execute every tool call the model made this round. Today we
-        # only know about `web_search`; unknown names get a polite stub
-        # so the loop can recover.
+        # Execute every tool call the model made this round. Unknown
+        # names get a polite stub so the loop can recover.
         for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+
             if tc.function.name == "web_search":
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
                 query = (args.get("query") or "").strip()
                 if not query:
                     tool_result = "No query was provided."
@@ -501,6 +708,28 @@ def respond_to_message(
                         on_stage("searching", query=query)
                     print(f"[chat] web_search: {query!r}")
                     tool_result = _do_web_search(query)
+
+            elif tc.function.name == "find_products":
+                query = (args.get("query") or "").strip()
+                num_options = args.get("num_options") or 2
+                num_options = max(1, min(3, int(num_options)))
+                if not query:
+                    tool_result = "No query was provided."
+                else:
+                    if on_stage:
+                        # Same "searching" stage label — from the user's
+                        # POV this is identical to a web search in
+                        # progress, just scoped to products.
+                        on_stage("searching", query=query)
+                    print(
+                        f"[chat] find_products: {query!r} "
+                        f"(n={num_options})"
+                    )
+                    tool_result, picks = _find_products(query, num_options)
+                    # Picks are accumulated across all tool calls this
+                    # turn — if the model decides on a comparison later,
+                    # those cards land on the assistant message too.
+                    product_picks.extend(picks)
             else:
                 tool_result = (
                     f"Unknown tool '{tc.function.name}'. Answer without it."
@@ -519,11 +748,20 @@ def respond_to_message(
 
     # Persist user + assistant messages. The intermediate tool turns are
     # NOT persisted to chat history (that's an internal LLM mechanism
-    # the user doesn't need to see scroll-back through).
+    # the user doesn't need to see scroll-back through). Product picks
+    # are attached to the assistant message so cards re-render on
+    # reload, not just immediately after the send.
     store.add_message(conv_id, "user", user_message, image_urls=image_urls)
-    store.add_message(conv_id, "assistant", assistant_text)
+    store.add_message(
+        conv_id, "assistant", assistant_text,
+        product_picks=product_picks if product_picks else None,
+    )
 
-    return {"text": assistant_text, "searches": searches}
+    return {
+        "text": assistant_text,
+        "searches": searches,
+        "product_picks": product_picks,
+    }
 
 
 def extract_calendar_updates(home_id: int, user_message: str,

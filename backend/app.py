@@ -670,6 +670,7 @@ def _run_chat_job(
             "response": outcome["text"],
             "image_urls": photo_urls,
             "searches": outcome.get("searches") or [],
+            "product_picks": outcome.get("product_picks") or [],
         }
         _finish_chat_job(chat_id, result)
 

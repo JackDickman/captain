@@ -163,29 +163,112 @@ struct ChatView: View {
     }
 
     private func bubble(for msg: ChatMessage) -> some View {
-        HStack(alignment: .top) {
-            if msg.role == .user { Spacer(minLength: 40) }
+        let isUser = msg.role == .user
+        return HStack(alignment: .top, spacing: 0) {
+            if isUser { Spacer(minLength: 40) }
             VStack(alignment: .leading, spacing: 8) {
-                if let urls = msg.imageUrls, !urls.isEmpty {
-                    bubbleImages(urls: urls)
+                // The bubble proper — text + photo attachments.
+                VStack(alignment: .leading, spacing: 8) {
+                    if let urls = msg.imageUrls, !urls.isEmpty {
+                        bubbleImages(urls: urls)
+                    }
+                    if !msg.content.isEmpty {
+                        Text(attributedMarkdown(msg.content))
+                            .font(CaptainTheme.body(15))
+                            .foregroundStyle(isUser
+                                ? .white
+                                : CaptainTheme.textPrimary)
+                            .textSelection(.enabled)
+                    }
                 }
-                if !msg.content.isEmpty {
-                    Text(attributedMarkdown(msg.content))
-                        .font(CaptainTheme.body(15))
-                        .foregroundStyle(msg.role == .user
-                            ? .white
-                            : CaptainTheme.textPrimary)
-                        .textSelection(.enabled)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(bubbleBackground(for: msg.role))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+                .overlay(bubbleBorder(for: msg.role))
+
+                // Product cards attached to assistant messages (only
+                // when the model used find_products with num_options >= 2).
+                if !isUser,
+                   let picks = msg.productPicks, !picks.isEmpty {
+                    productCardsView(picks: picks)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(bubbleBackground(for: msg.role))
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay(bubbleBorder(for: msg.role))
-            if msg.role == .assistant { Spacer(minLength: 40) }
+            if !isUser { Spacer(minLength: 40) }
         }
         .padding(.horizontal, 16)
+    }
+
+    /// Vertical stack of product picks Captain attached to an assistant
+    /// turn, plus a small affiliate-disclosure footer below them.
+    private func productCardsView(picks: [ProductPick]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(picks.indices, id: \.self) { i in
+                productCard(picks[i])
+            }
+            // FTC requires this — quiet but present. Spec'd to match
+            // the muted secondary type elsewhere in the app.
+            Text("Captain earns from qualifying purchases.")
+                .font(CaptainTheme.body(10))
+                .foregroundStyle(CaptainTheme.textMuted.opacity(0.7))
+                .padding(.top, 2)
+                .padding(.leading, 4)
+        }
+    }
+
+    /// One compact product card. Tapping anywhere opens the affiliate
+    /// URL in the user's browser (Safari / Amazon app via universal
+    /// link). Same visual register as the weather + radar cards:
+    /// creamDeep fill, brass border, MCM warmth.
+    private func productCard(_ pick: ProductPick) -> some View {
+        Link(destination: URL(string: pick.url)
+             ?? URL(string: "https://amazon.com")!) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "cart.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(CaptainTheme.brass)
+                    .frame(width: 22, height: 22)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(pick.retailer.lowercased())
+                        .font(CaptainTheme.label(9))
+                        .foregroundStyle(CaptainTheme.brass)
+                        .tracking(1.0)
+                        .textCase(.uppercase)
+                    Text(pick.title)
+                        .font(CaptainTheme.body(14, weight: .medium))
+                        .foregroundStyle(CaptainTheme.textPrimary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !pick.blurb.isEmpty {
+                        Text(pick.blurb)
+                            .font(CaptainTheme.body(12))
+                            .foregroundStyle(CaptainTheme.textMuted)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 14))
+                    .foregroundStyle(CaptainTheme.brass.opacity(0.7))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(CaptainTheme.creamDeep.opacity(0.7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(
+                                CaptainTheme.brass.opacity(0.35),
+                                lineWidth: 1
+                            )
+                    )
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     /// One large image when there's just one; otherwise a horizontal strip
@@ -507,6 +590,7 @@ struct ChatView: View {
             role: .user,
             content: text,
             imageUrls: optimisticUrls.isEmpty ? nil : optimisticUrls,
+            productPicks: nil,
             createdAt: Date().timeIntervalSince1970
         )
         messages.append(optimistic)
