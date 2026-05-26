@@ -54,6 +54,7 @@ from first_session import (  # noqa: E402
     extract_home_features,
     firecrawl_search,
     pick_current_season,
+    validate_setup_inputs,
 )
 from backend import store, profiles, chat as chat_mod, geocode, radar  # noqa: E402
 
@@ -163,6 +164,7 @@ _jobs_lock = threading.Lock()
 # screen reads as a quiet narration of what Captain is doing.
 _STAGE_MESSAGES = {
     "starting": "Captain is getting to know your home",
+    "checking": "Making sure that's your home…",
     "searching": "Looking up your home in public records…",
     "studying": "Studying the photo of your home…",
     "painting": "Painting a portrait of your home…",
@@ -248,6 +250,18 @@ def _run_first_session_job(
     try:
         client = OpenAI()
         current_season = pick_current_season()
+
+        # Stage 0: sanity-check the photo + address before burning 30+s
+        # of pipeline work. Cheap (geocode + one nano-vision call ≈ 2-3s).
+        # A failure here ends the job with a user-facing message that iOS
+        # surfaces directly in the form view.
+        _set_stage(job_id, "checking")
+        ok, validation_error = validate_setup_inputs(
+            client, photo_path, address,
+        )
+        if not ok:
+            _fail_job(job_id, validation_error or "Validation failed.")
+            return
 
         # Stage 1: geocode + firecrawl (cheap network + property scrape)
         _set_stage(job_id, "searching")

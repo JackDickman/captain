@@ -254,6 +254,11 @@ struct FirstSessionView: View {
                     }
                 )
                 appState.setFirstSession(response)
+            } catch CaptainAPI.APIError.userMessage(let msg) {
+                // Validation-style error from the backend — surface verbatim,
+                // no "backend on localhost…" hint (the backend was clearly
+                // reachable; it just rejected the input).
+                errorMessage = msg
             } catch {
                 errorMessage = error.localizedDescription
                     + "\n\nMake sure the backend is running on localhost:8000."

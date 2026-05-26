@@ -281,6 +281,121 @@ def get_or_render_home(
     return out
 
 
+# Validation runs before the expensive pipeline; nano is plenty for a
+# yes/no "is this a residential home exterior" classification.
+VALIDATION_MODEL = os.getenv("CAPTAIN_VALIDATION_MODEL", "gpt-5.4-nano")
+
+
+def validate_setup_inputs(
+    client: OpenAI, photo_path: Path, address: str,
+) -> tuple[bool, str | None]:
+    """Stage-0 sanity check before kicking off the real first-session.
+
+    Returns (ok, user_facing_error). When ok=True, error is None. When
+    ok=False, the error is a short sentence safe to surface directly in
+    the iOS form view ("We couldn't find that address…").
+
+    The address is geocoded first (fast — ~300ms via the US Census
+    geocoder), then the photo is sent to a small vision model that
+    classifies whether the image is primarily a residential home
+    exterior. Both checks run unconditionally so a user with two bad
+    inputs gets both messages in one round-trip (we still pay for the
+    vision call, but the resulting UX is worth it).
+    """
+    from backend.geocode import geocode_address
+
+    errors: list[str] = []
+
+    if not geocode_address(address):
+        errors.append(
+            "We couldn't find that address. Make sure it includes the "
+            "street number, street name, city, and state — e.g. "
+            "\"4221 Silsby Rd, University Heights, OH 44118\"."
+        )
+
+    photo_ok, photo_reason = _validate_photo_is_home(client, photo_path)
+    if not photo_ok:
+        errors.append(
+            f"That photo doesn't look like the outside of a home — "
+            f"{photo_reason} Try a clear daytime shot of the front of "
+            f"your house."
+        )
+
+    if errors:
+        return False, "\n\n".join(errors)
+    return True, None
+
+
+def _validate_photo_is_home(
+    client: OpenAI, photo_path: Path,
+) -> tuple[bool, str]:
+    """Vision classifier: accept if the photo is plausibly an outdoor shot
+    of a residential building's exterior. Liberal on edge cases (people,
+    pets, vehicles in the frame are fine); strict on obvious mismatches
+    (indoor shots, floor plans, food, screenshots, etc.). On any LLM
+    failure, we ACCEPT the photo — the validator is a soft filter, not a
+    gate, and we'd rather let a borderline case through than block on
+    classifier flakiness."""
+    try:
+        img_bytes = photo_path.read_bytes()
+    except OSError as e:
+        return False, f"the photo file couldn't be read ({e})."
+
+    suffix = photo_path.suffix.lower().lstrip(".")
+    mime = "jpeg" if suffix == "jpg" else suffix
+    data_url = (
+        f"data:image/{mime};base64,"
+        f"{base64.b64encode(img_bytes).decode()}"
+    )
+
+    prompt = (
+        "Look at this photograph. Is it primarily an outdoor photo of a "
+        "residential home's exterior — the front, back, or side of a "
+        "house, townhouse, condo, apartment building, or similar? People, "
+        "cars, pets, plants, or street elements in the frame are FINE as "
+        "long as a residential building is clearly the main subject. "
+        "Reject the photo only when it is clearly NOT a residential "
+        "building exterior — e.g. indoor scenes, floor plans, MLS "
+        "screenshots, food, animals as the subject, landscapes with no "
+        "building, abstract images.\n\n"
+        "Respond with strict JSON only: "
+        "{\"is_home_exterior\": true|false, \"reason\": \"...\"}. "
+        "When false, `reason` is a short lowercase sentence fragment "
+        "we can show directly to the user (\"it looks like an indoor "
+        "kitchen.\", \"this is a floor plan, not a photo.\")."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=VALIDATION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(resp.choices[0].message.content or "{}")
+    except Exception as e:  # noqa: BLE001
+        # Soft-fail open: don't block the user on a flaky classifier.
+        print(f"[validate] photo check failed (accepting anyway): {e}")
+        return True, ""
+
+    if result.get("is_home_exterior") is True:
+        return True, ""
+    reason = (
+        result.get("reason")
+        or "it doesn't look like the exterior of a home."
+    )
+    # Normalize trailing punctuation so we can append our own sentence.
+    reason = str(reason).strip()
+    if reason and reason[-1] not in ".!?":
+        reason += "."
+    return False, reason
+
+
 def pick_current_season() -> str:
     m = time.localtime().tm_mon
     if m in (3, 4, 5):

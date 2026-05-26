@@ -12,6 +12,10 @@ enum CaptainAPI {
     enum APIError: Error, LocalizedError {
         case badStatus(Int, String)
         case decoding(Error)
+        /// User-facing validation error from the backend (bad photo / bad
+        /// address during first-session). Surfaced verbatim — no HTTP
+        /// chrome — because the message was already written for users.
+        case userMessage(String)
 
         var errorDescription: String? {
             switch self {
@@ -19,6 +23,8 @@ enum CaptainAPI {
                 return "Backend returned HTTP \(code): \(body.prefix(200))"
             case let .decoding(err):
                 return "Couldn't decode backend response: \(err.localizedDescription)"
+            case let .userMessage(message):
+                return message
             }
         }
     }
@@ -89,7 +95,11 @@ enum CaptainAPI {
                 if let result = status.result { return result }
                 throw APIError.badStatus(200, "done but no result")
             case "error":
-                throw APIError.badStatus(500, status.error ?? "unknown error")
+                // The backend's error string is user-facing (set by
+                // _fail_job, which carries validation messages verbatim).
+                throw APIError.userMessage(
+                    status.error ?? "Something went wrong."
+                )
             default:
                 continue  // still running
             }
