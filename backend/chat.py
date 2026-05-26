@@ -25,12 +25,12 @@ from __future__ import annotations
 import base64
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from openai import OpenAI
 
-from . import profiles, store
+from . import profiles, radar, store
 
 # Chat is the user-facing brain — the success criterion "noticeably better
 # than ChatGPT" lives here. Use the strongest mini we can.
@@ -128,17 +128,23 @@ RECENT EVENTS AND UPCOMING ITEMS ON THIS HOME'S CALENDAR (most recent first):
 
 When you respond:
   - Use the context above to be specific to THIS home and THIS owner. Generic answers betray the whole product.
-  - Keep responses concise unless the question genuinely warrants depth. Long lectures break the conversation."""
+  - Keep responses concise unless the question genuinely warrants depth. Long lectures break the conversation.
 
-
-def _format_messages_for_llm(system_prompt: str,
-                             history: list[dict],
-                             user_message: str) -> list[dict]:
-    msgs: list[dict] = [{"role": "system", "content": system_prompt}]
-    for m in history:
-        msgs.append({"role": m["role"], "content": m["content"]})
-    msgs.append({"role": "user", "content": user_message})
-    return msgs
+Drawing out durable details (the biographer's instinct):
+  Part of your job is to capture specifics the owner will be glad to have a year from now. When a conversation naturally touches a moment where a concrete number, brand, vendor, or measurement would be useful later, ask one quiet follow-up — at the END of your response, after you've actually helped — to surface it. Examples:
+    - mulching the beds → "Out of curiosity, how many bags did you end up needing? Worth jotting down for next spring."
+    - painting the trim → "What paint did you use? — handy to have on file when you need to touch up."
+    - had a plumber out → "Who did the work? I'll keep their name on hand."
+    - planted hostas → "How many did you put in? And what variety, if you know?"
+    - replaced a furnace filter → "What size and brand? I'll remember it for the next swap."
+    - paid for tree trimming → "Roughly how often do you have that done?" (NEVER ask the cost — financial surfaces are off-limits.)
+  Hard rules for these questions:
+    - One question per response, maximum. Two questions in one turn reads as an interview.
+    - Never lead with the question. Help first; ask second, only if there's a real fact worth pinning.
+    - Skip the ask when the owner clearly wants a quick answer, is venting/frustrated, or the conversation is about feelings/aesthetics rather than concrete work.
+    - Skip the ask if the answer is already in the home or owner profile.
+    - Phrasing should feel like a curious friend, not a form: "Out of curiosity…", "Worth noting — did you…", "What brand did you go with?" — never "Please provide…" or "For my records…".
+    - NEVER ask about prices paid, costs, or financial figures."""
 
 
 def _image_part(path: Path) -> dict:
@@ -233,9 +239,10 @@ def extract_calendar_updates(home_id: int, user_message: str,
         " - observation: noticed issues (\"there's a crack in the wall\")\n\n"
         "For dates: use ISO YYYY-MM-DD. If the owner says \"today\" use "
         f"{datetime.now().date().isoformat()}. \"Tomorrow\" = "
-        f"{datetime.now().date().toordinal() + 1}. \"This weekend\" = the "
-        "upcoming Saturday. \"Next month\" = first of next month. If no "
-        "date is implied at all, set occurred_at to null.\n\n"
+        f"{(datetime.now().date() + timedelta(days=1)).isoformat()}. "
+        "\"This weekend\" = the upcoming Saturday. \"Next month\" = first "
+        "of next month. If no date is implied at all, set occurred_at to "
+        "null.\n\n"
         "If nothing in this exchange warrants a calendar entry, return "
         "an empty array. Empty is the most common case — don't reach for "
         "entries that aren't there.\n\n"
@@ -293,6 +300,13 @@ def update_memory_from_exchange(
         extract_calendar_updates(home_id, user_message, assistant_message)
     except Exception as e:  # noqa: BLE001
         print(f"[memory] calendar extraction failed: {e}")
+    # Profiles or calendar may have changed — drop the radar cache so the
+    # next /radar call regenerates against the fresh context. Cheap to
+    # invalidate; the next foreground load will absorb a 2-5s LLM call.
+    try:
+        radar.invalidate_cache()
+    except Exception as e:  # noqa: BLE001
+        print(f"[memory] radar cache invalidation failed: {e}")
 
 
 # ---------- fixture ----------

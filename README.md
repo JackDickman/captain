@@ -12,11 +12,13 @@ This repo is a personal pet project.
 - `render_prototype.py` — Peanuts-style home rendering + palette extraction
 - `first_session.py` — first-session pipeline (photo + address → features + rendering)
 - `backend/` — FastAPI dev backend
-  - `app.py` — endpoints: `/first-session`, `/chat`, `/messages`, `/weather`, `/debug/state`
+  - `app.py` — endpoints: `/first-session`, `/chat`, `/messages`, `/weather`, `/radar`, `/profile`, `/debug/state`
   - `chat.py` — chat handler + background memory-update orchestrator
   - `profiles.py` — markdown-document memory layer (`home.md` + `user.md`)
+  - `radar.py` — calendar + LLM-suggestion blending behind `/radar` (2-hour cache)
   - `store.py` — SQLite persistence (calendar, conversations, messages)
   - `weather.py` — NWS forecast fetcher
+  - `geocode.py` — US Census address → (lat, lng)
 - `ios/` — SwiftUI app
   - `project.yml` — XcodeGen spec (source of truth; xcodeproj is regenerated)
   - `Captain/` — Swift sources (Models, Views, Networking, Design, etc.)

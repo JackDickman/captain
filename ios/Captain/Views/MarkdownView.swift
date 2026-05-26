@@ -29,6 +29,7 @@ struct MarkdownView: View {
         case h3(String)
         case paragraph(String)
         case bullet(String)
+        case numbered(marker: String, text: String)
         case blank
     }
 
@@ -63,6 +64,9 @@ struct MarkdownView: View {
             } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
                 flush()
                 out.append(.bullet(String(line.dropFirst(2))))
+            } else if let parsed = parseOrderedListItem(line) {
+                flush()
+                out.append(.numbered(marker: parsed.marker, text: parsed.text))
             } else {
                 paragraphBuffer.append(line)
             }
@@ -106,9 +110,38 @@ struct MarkdownView: View {
                     .foregroundStyle(CaptainTheme.textPrimary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        case .numbered(let marker, let text):
+            HStack(alignment: .top, spacing: 8) {
+                Text("\(marker).")
+                    .font(CaptainTheme.body(15, weight: .semibold))
+                    .foregroundStyle(CaptainTheme.brass)
+                    .frame(minWidth: 18, alignment: .trailing)
+                Text(inlineAttributed(text))
+                    .font(CaptainTheme.body(15))
+                    .foregroundStyle(CaptainTheme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         case .blank:
             Color.clear.frame(height: 2)
         }
+    }
+
+    /// Recognize a leading ordered-list marker like "1. " / "12) ". Returns
+    /// the marker digits + the rest, or nil if the line doesn't match.
+    private func parseOrderedListItem(_ line: String) -> (marker: String, text: String)? {
+        var digits = ""
+        var idx = line.startIndex
+        while idx < line.endIndex, line[idx].isNumber {
+            digits.append(line[idx])
+            idx = line.index(after: idx)
+        }
+        guard !digits.isEmpty, idx < line.endIndex else { return nil }
+        let sep = line[idx]
+        guard sep == "." || sep == ")" else { return nil }
+        let afterSep = line.index(after: idx)
+        guard afterSep < line.endIndex, line[afterSep] == " " else { return nil }
+        let rest = String(line[line.index(after: afterSep)...])
+        return (digits, rest)
     }
 
     /// Parse inline markdown (bold, italic, links, code) for a single
