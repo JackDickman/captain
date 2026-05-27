@@ -10,9 +10,11 @@ struct HomeView: View {
     @State private var chatPresented = false
     @State private var profilePresented = false
     @State private var radarPresented = false
+    @State private var huntPresented = false
     @State private var weatherPeriods: [WeatherPeriod] = []
     @State private var radar: RadarResponse?
     @State private var radarLoading = true
+    @State private var hunt: HuntResponse?
 
 
     var body: some View {
@@ -31,8 +33,14 @@ struct HomeView: View {
                 RadarView(radar: radar)
             }
         }
+        .sheet(isPresented: $huntPresented, onDismiss: {
+            Task { await loadHunt() }
+        }) {
+            HuntView()
+        }
         .task { await loadWeather() }
         .task { await loadRadar() }
+        .task { await loadHunt() }
         .onAppear {
             let args = ProcessInfo.processInfo.arguments
             // Debug: launch with --auto-chat / --show-profile to open the
@@ -64,6 +72,12 @@ struct HomeView: View {
         }
     }
 
+    private func loadHunt() async {
+        if let result = try? await CaptainAPI.fetchHunt() {
+            hunt = result
+        }
+    }
+
     // MARK: - Background
 
     private var background: some View {
@@ -78,6 +92,11 @@ struct HomeView: View {
             topBlock
             Spacer().frame(height: 18)
             heroImage
+            if let hunt, !hunt.complete {
+                Spacer().frame(height: 14)
+                huntBanner(hunt)
+                    .padding(.horizontal, 24)
+            }
             Spacer().frame(height: 14)
             WeatherWidget(periods: weatherPeriods)
                 .padding(.horizontal, 24)
@@ -199,6 +218,68 @@ struct HomeView: View {
         )
         .mcmShadow()
         .padding(.horizontal, 24)
+    }
+
+    // MARK: - Hunt banner
+
+    /// Quiet entry point for the scavenger hunt — visible above the
+    /// weather widget until the hunt is complete. Disappears entirely
+    /// once every applicable item has been resolved (done / skipped /
+    /// not-applicable).
+    private func huntBanner(_ hunt: HuntResponse) -> some View {
+        Button {
+            huntPresented = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "map.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(CaptainTheme.brass)
+                    .frame(width: 28, height: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(huntBannerLead(hunt))
+                        .font(CaptainTheme.body(14, weight: .medium))
+                        .foregroundStyle(CaptainTheme.textPrimary)
+                        .lineLimit(1)
+                    Text(huntBannerDetail(hunt))
+                        .font(CaptainTheme.body(11))
+                        .foregroundStyle(CaptainTheme.textMuted)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CaptainTheme.brass)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(CaptainTheme.creamDeep.opacity(0.7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .strokeBorder(
+                                CaptainTheme.brass.opacity(0.4),
+                                lineWidth: 1
+                            )
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func huntBannerLead(_ hunt: HuntResponse) -> String {
+        if hunt.resolved == 0 {
+            return "Captain wants to learn your home"
+        }
+        return "Pick up where you left off"
+    }
+
+    private func huntBannerDetail(_ hunt: HuntResponse) -> String {
+        if hunt.resolved == 0 {
+            return "A quick guided tour — \(hunt.total) things"
+        }
+        return "\(hunt.resolved) of \(hunt.total) done"
     }
 
     // MARK: - Chat capsule

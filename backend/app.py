@@ -59,12 +59,16 @@ from first_session import (  # noqa: E402
     pick_current_season,
     validate_setup_inputs,
 )
-from backend import store, profiles, chat as chat_mod, geocode, radar  # noqa: E402
+from backend import (  # noqa: E402
+    store, profiles, chat as chat_mod, geocode, radar, hunt as hunt_mod,
+)
 
 RENDERED_DIR = Path(__file__).parent / "rendered"
 RENDERED_DIR.mkdir(exist_ok=True)
 CHAT_PHOTOS_DIR = Path(__file__).parent / "chat-photos"
 CHAT_PHOTOS_DIR.mkdir(exist_ok=True)
+HUNT_PHOTOS_DIR = Path(__file__).parent / "hunt-photos"
+HUNT_PHOTOS_DIR.mkdir(exist_ok=True)
 
 # Initialise SQLite schema + markdown profile files on import so the very
 # first request can hit them without a migration step.
@@ -90,6 +94,11 @@ app.mount(
     "/chat-photos",
     StaticFiles(directory=str(CHAT_PHOTOS_DIR)),
     name="chat-photos",
+)
+app.mount(
+    "/hunt-photos",
+    StaticFiles(directory=str(HUNT_PHOTOS_DIR)),
+    name="hunt-photos",
 )
 
 
@@ -1013,6 +1022,182 @@ def delete_calendar_entry(entry_id: int) -> dict:
     except Exception as e:  # noqa: BLE001
         print(f"[calendar] radar cache invalidation failed: {e}")
     return {"deleted": entry_id}
+
+
+# ---------- Scavenger hunt ----------
+
+def _hunt_state_payload(home_id: int) -> dict:
+    """Build the payload returned by /hunt: applicable items resolved
+    against current progress + branch-question state. Items are returned
+    in catalog order so the iOS list preserves category grouping."""
+    progress = store.get_hunt_progress(home_id)
+    state = hunt_mod.state_from_progress(progress)
+    visible = hunt_mod.applicable_items(state)
+
+    progress_by_id = {p["item_id"]: p for p in progress}
+
+    items: list[dict] = []
+    for item in visible:
+        p = progress_by_id.get(item.id)
+        status = (p or {}).get("status") or "pending"
+        items.append({
+            "id": item.id,
+            "title": item.title,
+            "category": item.category,
+            "description": item.description,
+            "where_to_look": item.where_to_look,
+            "has_photo": item.has_photo,
+            "question_prompt": item.question_prompt,
+            "placeholder": item.placeholder,
+            "status": status,
+            "notes": (p or {}).get("notes"),
+            "photo_url": (p or {}).get("photo_url"),
+            "completed_at": (p or {}).get("completed_at"),
+        })
+
+    done = sum(1 for i in items if i["status"] == "done")
+    resolved = sum(
+        1 for i in items
+        if i["status"] in ("done", "skipped", "not_applicable")
+    )
+    return {
+        "items": items,
+        "total": len(items),
+        "done": done,
+        "resolved": resolved,
+        "complete": resolved >= len(items) and len(items) > 0,
+    }
+
+
+@app.get("/hunt")
+def get_hunt() -> dict:
+    """Full hunt state — visible items + progress per item + counters.
+    iOS calls this on every entry and after every action (cheap; no
+    LLM, just DB)."""
+    home = store.get_home()
+    if not home:
+        return {
+            "items": [], "total": 0, "done": 0,
+            "resolved": 0, "complete": False,
+        }
+    return _hunt_state_payload(home["id"])
+
+
+@app.post("/hunt/{item_id}")
+async def complete_hunt_item(
+    background_tasks: BackgroundTasks,
+    item_id: str,
+    notes: Annotated[str, Form()] = "",
+    photo: Annotated[Optional[UploadFile], File()] = None,
+    x_captain_local_time: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """Mark a hunt item done. Photo items require a photo; text items
+    require notes. Captured info is fed into the existing profile
+    rewriter as a background task so it integrates into home.md /
+    user.md naturally."""
+    item = hunt_mod.ITEMS_BY_ID.get(item_id)
+    if not item:
+        raise HTTPException(404, f"unknown hunt item: {item_id}")
+
+    home = store.get_home()
+    if not home:
+        raise HTTPException(400, "no home yet — finish first-session first")
+
+    notes = (notes or "").strip()
+
+    # Save the photo (if any) to hunt-photos/.
+    photo_url: str | None = None
+    photo_path: Path | None = None
+    real_photo = (
+        photo is not None and getattr(photo, "filename", "")
+    )
+    if real_photo:
+        suffix = (
+            Path(photo.filename or "upload.jpg").suffix.lower() or ".jpg"
+        )
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            raise HTTPException(400, f"unsupported photo format: {suffix}")
+        fname = f"{item_id}-{uuid.uuid4().hex}{suffix}"
+        photo_path = HUNT_PHOTOS_DIR / fname
+        with open(photo_path, "wb") as f:
+            shutil.copyfileobj(photo.file, f)
+        photo_url = f"/hunt-photos/{fname}"
+
+    # Each item kind has its own requirement: photo items must have a
+    # photo; text-only items must have a non-empty answer.
+    if item.has_photo and photo_path is None:
+        raise HTTPException(400, "this item requires a photo")
+    if not item.has_photo and not notes:
+        raise HTTPException(400, "this item requires a written answer")
+
+    store.upsert_hunt_item(
+        home["id"], item_id, "done",
+        notes=notes or None, photo_url=photo_url,
+    )
+
+    # Fold the captured info into the home/owner profile via the same
+    # rewriter the chat uses. We synthesize an exchange so the rewriter
+    # has natural prose to work with — the "[scavenger hunt: …]" tag
+    # gives the LLM a hint about provenance without leaking into the
+    # final profile text (the prompt instructs it to integrate, not
+    # quote).
+    synth_user_parts = [f"[scavenger hunt: {item.title}]"]
+    if notes:
+        synth_user_parts.append(notes)
+    elif photo_path is not None:
+        synth_user_parts.append(f"(photo of {item.title.lower()} attached)")
+    synth_user = " ".join(synth_user_parts)
+    synth_assistant = f"Got it — noted {item.title.lower()}."
+
+    user_now = _parse_local_time(x_captain_local_time)
+    image_paths = [photo_path] if photo_path else []
+    background_tasks.add_task(
+        chat_mod.update_memory_from_exchange,
+        home["id"], synth_user, synth_assistant, image_paths,
+        now=user_now,
+    )
+
+    return _hunt_state_payload(home["id"])
+
+
+@app.post("/hunt/{item_id}/skip")
+def skip_hunt_item(item_id: str) -> dict:
+    """Mark an item as skipped — user can come back to it later. The
+    list still shows it; the count of resolved-vs-total reflects skips."""
+    if item_id not in hunt_mod.ITEMS_BY_ID:
+        raise HTTPException(404, f"unknown hunt item: {item_id}")
+    home = store.get_home()
+    if not home:
+        raise HTTPException(400, "no home yet")
+    store.upsert_hunt_item(home["id"], item_id, "skipped")
+    return _hunt_state_payload(home["id"])
+
+
+@app.post("/hunt/{item_id}/not-applicable")
+def na_hunt_item(item_id: str) -> dict:
+    """Mark an item as not-applicable. Counts toward 'resolved' so the
+    overall hunt can complete without bogus pending items."""
+    if item_id not in hunt_mod.ITEMS_BY_ID:
+        raise HTTPException(404, f"unknown hunt item: {item_id}")
+    home = store.get_home()
+    if not home:
+        raise HTTPException(400, "no home yet")
+    store.upsert_hunt_item(home["id"], item_id, "not_applicable")
+    return _hunt_state_payload(home["id"])
+
+
+@app.post("/hunt/{item_id}/reset")
+def reset_hunt_item(item_id: str) -> dict:
+    """Move an item back to pending. Used by iOS when the user wants to
+    redo a previously-completed item (the next submission overwrites
+    notes / photo)."""
+    if item_id not in hunt_mod.ITEMS_BY_ID:
+        raise HTTPException(404, f"unknown hunt item: {item_id}")
+    home = store.get_home()
+    if not home:
+        raise HTTPException(400, "no home yet")
+    store.upsert_hunt_item(home["id"], item_id, "pending")
+    return _hunt_state_payload(home["id"])
 
 
 @app.get("/debug/state")

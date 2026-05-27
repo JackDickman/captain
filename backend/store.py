@@ -73,6 +73,19 @@ CREATE TABLE IF NOT EXISTS conversations (
     FOREIGN KEY (home_id) REFERENCES home(id)
 );
 
+CREATE TABLE IF NOT EXISTS hunt_progress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    home_id INTEGER NOT NULL,
+    item_id TEXT NOT NULL,
+    status TEXT NOT NULL,         -- pending | done | skipped | not_applicable
+    notes TEXT,                   -- user's captured text answer
+    photo_url TEXT,               -- relative URL of the captured photo
+    completed_at REAL,            -- unix epoch when status became 'done'
+    UNIQUE(home_id, item_id),
+    FOREIGN KEY (home_id) REFERENCES home(id)
+);
+CREATE INDEX IF NOT EXISTS idx_hunt_home ON hunt_progress(home_id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id INTEGER NOT NULL,
@@ -401,6 +414,75 @@ def clear_messages(conversation_id: int) -> int:
             (conversation_id,),
         )
         return cur.rowcount
+
+
+# ---------- scavenger hunt progress ----------
+
+def get_hunt_progress(home_id: int) -> list[dict]:
+    """All hunt rows for this home (any status). Caller filters."""
+    with connect() as c:
+        rows = c.execute(
+            """SELECT item_id, status, notes, photo_url, completed_at
+               FROM hunt_progress WHERE home_id = ?""",
+            (home_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_hunt_item(home_id: int, item_id: str) -> dict | None:
+    with connect() as c:
+        row = c.execute(
+            """SELECT item_id, status, notes, photo_url, completed_at
+               FROM hunt_progress
+               WHERE home_id = ? AND item_id = ?""",
+            (home_id, item_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_hunt_item(
+    home_id: int, item_id: str, status: str,
+    *, notes: str | None = None, photo_url: str | None = None,
+) -> None:
+    """Insert or update a single item's progress. Status 'done' stamps
+    completed_at; other transitions leave it alone (so re-skipping a
+    previously-done item still records the original completion time)."""
+    now = time.time() if status == "done" else None
+    with connect() as c:
+        # Pull existing row to preserve photo_url / notes / completed_at
+        # when callers update partial fields.
+        existing = c.execute(
+            """SELECT notes, photo_url, completed_at
+               FROM hunt_progress
+               WHERE home_id = ? AND item_id = ?""",
+            (home_id, item_id),
+        ).fetchone()
+        if existing:
+            keep_notes = notes if notes is not None else existing["notes"]
+            keep_photo = (
+                photo_url if photo_url is not None else existing["photo_url"]
+            )
+            keep_completed = (
+                now if status == "done" else existing["completed_at"]
+            )
+            c.execute(
+                """UPDATE hunt_progress
+                   SET status = ?, notes = ?, photo_url = ?,
+                       completed_at = ?
+                   WHERE home_id = ? AND item_id = ?""",
+                (
+                    status, keep_notes, keep_photo, keep_completed,
+                    home_id, item_id,
+                ),
+            )
+        else:
+            c.execute(
+                """INSERT INTO hunt_progress
+                     (home_id, item_id, status, notes, photo_url,
+                      completed_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (home_id, item_id, status, notes, photo_url, now),
+            )
 
 
 def delete_calendar_entry(home_id: int, entry_id: int) -> bool:

@@ -468,6 +468,121 @@ enum CaptainAPI {
         }
     }
 
+    // MARK: - Scavenger hunt
+
+    /// GET /hunt — full hunt state (applicable items + progress).
+    static func fetchHunt() async throws -> HuntResponse {
+        let url = baseURL.appendingPathComponent("hunt")
+        var request = makeRequest(url: url)
+        request.timeoutInterval = 20
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.expectOK(response)
+        do {
+            return try JSONDecoder().decode(HuntResponse.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// POST /hunt/{id} — mark an item done with optional photo + notes.
+    /// Photo items require a photo; text-only items require notes.
+    /// Returns the updated full state.
+    static func completeHuntItem(
+        _ itemId: String, notes: String, photo: Data?,
+    ) async throws -> HuntResponse {
+        let url = baseURL.appendingPathComponent("hunt/\(itemId)")
+        let boundary = "Boundary-\(UUID().uuidString)"
+
+        var request = makeRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        // Photo extraction kicks off in the background; the foreground
+        // call just persists + returns the new state, so ~1s.
+        request.timeoutInterval = 60
+
+        var body = Data()
+        func appendString(_ s: String) {
+            body.append(s.data(using: .utf8)!)
+        }
+        appendString("--\(boundary)\r\n")
+        appendString("Content-Disposition: form-data; name=\"notes\"\r\n\r\n")
+        appendString("\(notes)\r\n")
+
+        if let photo {
+            let compressed = compressForUpload(photo, maxDim: 1280)
+            appendString("--\(boundary)\r\n")
+            appendString(
+                "Content-Disposition: form-data; name=\"photo\"; " +
+                "filename=\"\(itemId).jpg\"\r\n"
+            )
+            appendString("Content-Type: image/jpeg\r\n\r\n")
+            body.append(compressed)
+            appendString("\r\n")
+        }
+        appendString("--\(boundary)--\r\n")
+        request.httpBody = body
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.expectOK(response, data)
+        do {
+            return try JSONDecoder().decode(HuntResponse.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// POST /hunt/{id}/skip — set status to skipped.
+    static func skipHuntItem(_ itemId: String) async throws -> HuntResponse {
+        try await huntAction(itemId, action: "skip")
+    }
+
+    /// POST /hunt/{id}/not-applicable — set status to not_applicable.
+    static func huntItemNotApplicable(
+        _ itemId: String,
+    ) async throws -> HuntResponse {
+        try await huntAction(itemId, action: "not-applicable")
+    }
+
+    /// POST /hunt/{id}/reset — move back to pending for a redo.
+    static func resetHuntItem(_ itemId: String) async throws -> HuntResponse {
+        try await huntAction(itemId, action: "reset")
+    }
+
+    private static func huntAction(
+        _ itemId: String, action: String,
+    ) async throws -> HuntResponse {
+        let url = baseURL.appendingPathComponent("hunt/\(itemId)/\(action)")
+        var request = makeRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.expectOK(response, data)
+        do {
+            return try JSONDecoder().decode(HuntResponse.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// Common HTTP-status check used by hunt endpoints. Bubbles a
+    /// user-facing message when the backend returned a non-2xx so the
+    /// hunt UI can surface it inline.
+    private static func expectOK(
+        _ response: URLResponse, _ data: Data? = nil,
+    ) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.badStatus(-1, "no http response")
+        }
+        if !(200..<300).contains(http.statusCode) {
+            let body = data.flatMap { String(data: $0, encoding: .utf8) }
+                ?? "<binary>"
+            throw APIError.badStatus(http.statusCode, body)
+        }
+    }
+
     /// GET /profile — home + owner markdown profiles + full calendar.
     /// Used by ProfileView (the corner-avatar drawer).
     static func fetchProfile() async throws -> ProfileResponse {
