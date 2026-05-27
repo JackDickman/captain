@@ -33,8 +33,11 @@ import uuid
 from pathlib import Path
 from typing import Annotated, List, Optional
 
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
@@ -88,6 +91,32 @@ app.mount(
     StaticFiles(directory=str(CHAT_PHOTOS_DIR)),
     name="chat-photos",
 )
+
+
+def _parse_local_time(header_value: str | None) -> datetime:
+    """Parse the X-Captain-Local-Time header into a tz-aware datetime.
+
+    iOS sends this on every request as ISO 8601 with offset (e.g.
+    "2026-05-26T14:15:00-04:00") so any LLM prompt that talks about
+    "today" or "local time" can ground against the USER's clock — not
+    the server's. Falls back to server local time when the header is
+    absent or malformed; ensures the return value is always tz-aware
+    so callers can `strftime` without surprises.
+    """
+    if header_value:
+        try:
+            # Python 3.11+ accepts trailing 'Z' natively; older versions
+            # need it translated to '+00:00'. Cheap to handle either.
+            value = header_value.strip()
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            print(f"[time] bad X-Captain-Local-Time: {header_value!r}")
+    return datetime.now(timezone.utc).astimezone()
 
 
 @app.get("/health")
@@ -646,10 +675,15 @@ def _get_chat_job(chat_id: str) -> dict | None:
 def _run_chat_job(
     chat_id: str, home_id: int, user_message: str,
     saved_photo_paths: list[Path], photo_urls: list[str],
+    user_now: datetime,
 ) -> None:
     """Worker thread for a single chat turn. Wraps respond_to_message
     with the stage callback so the iOS UI can show what Captain is
-    doing as it works."""
+    doing as it works.
+
+    `user_now` carries the iOS device's local time + tz at the moment
+    the request was made, so the LLM's "today" / "local time" prompt
+    grounding tracks the user's clock instead of the server's."""
     def on_stage(stage: str, query: str | None = None) -> None:
         _set_chat_stage(chat_id, stage, query)
 
@@ -659,6 +693,7 @@ def _run_chat_job(
             image_paths=saved_photo_paths,
             image_urls=photo_urls,
             on_stage=on_stage,
+            now=user_now,
         )
         # The latest message id is the assistant message we just persisted.
         conv_id = store.get_or_create_conversation(home_id)
@@ -680,6 +715,7 @@ def _run_chat_job(
             chat_mod.update_memory_from_exchange(
                 home_id, user_message, outcome["text"],
                 saved_photo_paths,
+                now=user_now,
             )
         except Exception as e:  # noqa: BLE001
             print(f"[chat-job] memory update failed: {e}")
@@ -737,6 +773,7 @@ async def chat(
     background_tasks: BackgroundTasks,
     message: Annotated[str, Form()] = "",
     photos: Annotated[Optional[List[UploadFile]], File()] = None,
+    x_captain_local_time: Annotated[Optional[str], Header()] = None,
 ) -> dict:
     """Multipart form:
         message: text (may be empty when only photos are sent)
@@ -839,11 +876,15 @@ async def chat(
     # Real LLM path: kick off async job, return chat_id immediately.
     # iOS polls /chat/{chat_id} to see stage updates (thinking / searching
     # / writing) and to pick up the final result.
+    user_now = _parse_local_time(x_captain_local_time)
     chat_id = uuid.uuid4().hex[:12]
     _create_chat_job(chat_id)
     threading.Thread(
         target=_run_chat_job,
-        args=(chat_id, home_id, user_message, saved_photo_paths, photo_urls),
+        args=(
+            chat_id, home_id, user_message,
+            saved_photo_paths, photo_urls, user_now,
+        ),
         daemon=True,
     ).start()
 
@@ -893,7 +934,9 @@ def weather() -> dict:
 
 
 @app.get("/radar")
-def get_radar() -> dict:
+def get_radar(
+    x_captain_local_time: Annotated[Optional[str], Header()] = None,
+) -> dict:
     """What's on the owner's plate right now: upcoming calendar items +
     LLM-generated suggestions tied to the home's profile, weather, and
     season. Suggestions are cached for 2 hours."""
@@ -907,7 +950,8 @@ def get_radar() -> dict:
             "suggestions": [],
             "generated_at": _time.time(),
         }
-    return radar.build_radar_response(home["id"])
+    user_now = _parse_local_time(x_captain_local_time)
+    return radar.build_radar_response(home["id"], now=user_now)
 
 
 @app.get("/profile")

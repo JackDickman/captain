@@ -29,6 +29,32 @@ enum CaptainAPI {
         }
     }
 
+    /// Build a URLRequest with the `X-Captain-Local-Time` header pre-set
+    /// so any backend endpoint that injects "today" or "local time" into
+    /// LLM prompts (chat, radar, calendar extraction) can ground against
+    /// the user's clock instead of the server's. Falls back gracefully:
+    /// if the header is missing or malformed on the backend side, it
+    /// uses server-local time. ISO 8601 with offset ("…-04:00" / "…Z")
+    /// is parsed correctly by Python's datetime.fromisoformat.
+    private static func makeRequest(url: URL) -> URLRequest {
+        var r = URLRequest(url: url)
+        r.setValue(
+            localTimeString(), forHTTPHeaderField: "X-Captain-Local-Time"
+        )
+        return r
+    }
+
+    /// Current device-local time as an ISO 8601 string including the
+    /// UTC offset (e.g. "2026-05-26T14:15:00-04:00"). Recomputed every
+    /// call so a long-running app session always sends fresh values.
+    private static func localTimeString() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        return f.string(from: Date())
+    }
+
     /// Resize + re-encode an original photo to something the backend can
     /// process quickly. Original iPhone JPEGs are 5-10 MB; the LLM image
     /// endpoints don't benefit from anything beyond ~1500px on the long edge
@@ -61,7 +87,7 @@ enum CaptainAPI {
         let boundary = "Boundary-\(UUID().uuidString)"
         let compressed = compressForUpload(photo)
 
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(
             "multipart/form-data; boundary=\(boundary)",
@@ -180,7 +206,7 @@ enum CaptainAPI {
         let url = baseURL.appendingPathComponent("first-session")
         let boundary = "Boundary-\(UUID().uuidString)"
 
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(
             "multipart/form-data; boundary=\(boundary)",
@@ -237,7 +263,7 @@ enum CaptainAPI {
         jobId: String,
     ) async throws -> FirstSessionStatus {
         let url = baseURL.appendingPathComponent("first-session/\(jobId)")
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         request.timeoutInterval = 10
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -351,7 +377,7 @@ enum CaptainAPI {
         let url = baseURL.appendingPathComponent("chat")
         let boundary = "Boundary-\(UUID().uuidString)"
 
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(
             "multipart/form-data; boundary=\(boundary)",
@@ -404,7 +430,7 @@ enum CaptainAPI {
         chatId: String,
     ) async throws -> ChatStatus {
         let url = baseURL.appendingPathComponent("chat/\(chatId)")
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         request.timeoutInterval = 10
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -426,7 +452,7 @@ enum CaptainAPI {
     /// Used by RadarStrip (compact home-screen card) + RadarView (sheet).
     static func fetchRadar() async throws -> RadarResponse {
         let url = baseURL.appendingPathComponent("radar")
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         // LLM call on cold cache takes ~2-5s; cached is instant.
         request.timeoutInterval = 30
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -446,7 +472,8 @@ enum CaptainAPI {
     /// Used by ProfileView (the corner-avatar drawer).
     static func fetchProfile() async throws -> ProfileResponse {
         let url = baseURL.appendingPathComponent("profile")
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let request = makeRequest(url: url)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
@@ -463,7 +490,8 @@ enum CaptainAPI {
     /// the home screen date/weather widget.
     static func fetchWeather() async throws -> [WeatherPeriod] {
         let url = baseURL.appendingPathComponent("weather")
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let request = makeRequest(url: url)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
@@ -477,7 +505,7 @@ enum CaptainAPI {
     /// Profile + calendar + rendering are untouched.
     static func clearMessages() async throws {
         let url = baseURL.appendingPathComponent("messages")
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         request.httpMethod = "DELETE"
         request.timeoutInterval = 10
         let (_, response) = try await URLSession.shared.data(for: request)
@@ -492,7 +520,7 @@ enum CaptainAPI {
     /// from the profile drawer.
     static func deleteCalendarEntry(_ id: Int) async throws {
         let url = baseURL.appendingPathComponent("calendar/\(id)")
-        var request = URLRequest(url: url)
+        var request = makeRequest(url: url)
         request.httpMethod = "DELETE"
         request.timeoutInterval = 10
         let (_, response) = try await URLSession.shared.data(for: request)
@@ -507,7 +535,8 @@ enum CaptainAPI {
     /// view on launch / when ChatView first appears.
     static func fetchMessages() async throws -> [ChatMessage] {
         let url = baseURL.appendingPathComponent("messages")
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let request = makeRequest(url: url)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw APIError.badStatus(-1, "no http response")
         }

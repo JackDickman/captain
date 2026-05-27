@@ -186,10 +186,17 @@ def classify_message_scope(user_message: str) -> tuple[str, str]:
 
 
 def _build_system_prompt(home: dict, calendar: list[dict],
-                         weather: str) -> str:
+                         weather: str,
+                         *, now: datetime | None = None) -> str:
     """Build the chat system prompt from markdown profiles + structured
-    calendar + ambient context (weather, date/time)."""
-    now = datetime.now(timezone.utc).astimezone()
+    calendar + ambient context (weather, date/time).
+
+    `now` is the user's current local datetime (passed in from the
+    request handler via the X-Captain-Local-Time header). Falls back to
+    server local time if not provided — works correctly on the
+    pet-project setup where the backend runs on the user's machine."""
+    if now is None:
+        now = datetime.now(timezone.utc).astimezone()
     today = now.strftime("%A, %B %-d, %Y")
     local_time = now.strftime("%-I:%M %p")
 
@@ -589,6 +596,7 @@ def respond_to_message(
     image_paths: list[Path] | None = None,
     image_urls: list[str] | None = None,
     on_stage: callable | None = None,
+    now: datetime | None = None,
 ) -> dict:
     """Foreground: call LLM with full context + web-search tool, persist
     messages, return a structured result.
@@ -618,7 +626,7 @@ def respond_to_message(
     conv_id = store.get_or_create_conversation(home_id)
     history = store.get_recent_messages(conv_id, limit=20)
 
-    system_prompt = _build_system_prompt(home, calendar, weather)
+    system_prompt = _build_system_prompt(home, calendar, weather, now=now)
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     # Replay history as plain text (we don't re-send historical images —
     # the model has already seen their extracted facts via the profile
@@ -766,12 +774,20 @@ def respond_to_message(
 
 
 def extract_calendar_updates(home_id: int, user_message: str,
-                             assistant_message: str) -> dict:
+                             assistant_message: str,
+                             *, now: datetime | None = None) -> dict:
     """Background: scan the exchange for any dated events worth pinning to
     the calendar. Separate from the profile rewrite because (a) calendar
     stays structured and (b) different LLM call concerns => fewer failure
     coupling.
+
+    `now` is the user's current local datetime, used to resolve relative
+    references like "today" / "tomorrow" against the USER's clock, not
+    the server's.
     """
+    today = (now or datetime.now(timezone.utc).astimezone()).date()
+    tomorrow = today + timedelta(days=1)
+
     sys_prompt = (
         "You scan the latest message exchange in a homeowner-care app and "
         "extract any dated events worth adding to the home's calendar. "
@@ -785,8 +801,8 @@ def extract_calendar_updates(home_id: int, user_message: str,
         " - recurring: routine patterns (\"I always mow on Saturdays\")\n"
         " - observation: noticed issues (\"there's a crack in the wall\")\n\n"
         "For dates: use ISO YYYY-MM-DD. If the owner says \"today\" use "
-        f"{datetime.now().date().isoformat()}. \"Tomorrow\" = "
-        f"{(datetime.now().date() + timedelta(days=1)).isoformat()}. "
+        f"{today.isoformat()}. \"Tomorrow\" = "
+        f"{tomorrow.isoformat()}. "
         "\"This weekend\" = the upcoming Saturday. \"Next month\" = first "
         "of next month. If no date is implied at all, set occurred_at to "
         "null.\n\n"
@@ -831,12 +847,17 @@ def extract_calendar_updates(home_id: int, user_message: str,
 def update_memory_from_exchange(
     home_id: int, user_message: str, assistant_message: str,
     image_paths: list[Path] | None = None,
+    *, now: datetime | None = None,
 ) -> None:
     """Background entrypoint: rewrite markdown profiles AND extract any
     calendar entries from this exchange. The photos (if any) are passed to
     the profile rewriter so it can extract visible-only facts (a dog's
     breed, an appliance brand, a plant species). Failures in either don't
-    affect the foreground response."""
+    affect the foreground response.
+
+    `now` is the user's current local datetime; threaded into calendar
+    extraction so "today" / "tomorrow" resolve correctly against the
+    user's clock."""
     try:
         profiles.update_profiles_from_exchange(
             user_message, assistant_message, image_paths=image_paths,
@@ -844,7 +865,9 @@ def update_memory_from_exchange(
     except Exception as e:  # noqa: BLE001
         print(f"[memory] profile rewrite failed: {e}")
     try:
-        extract_calendar_updates(home_id, user_message, assistant_message)
+        extract_calendar_updates(
+            home_id, user_message, assistant_message, now=now,
+        )
     except Exception as e:  # noqa: BLE001
         print(f"[memory] calendar extraction failed: {e}")
     # Profiles or calendar may have changed — drop the radar cache so the

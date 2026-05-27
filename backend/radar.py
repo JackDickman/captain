@@ -116,8 +116,13 @@ def invalidate_cache() -> None:
         pass
 
 
-def generate_suggestions(home_id: int) -> list[dict]:
-    """LLM-generated radar suggestions. Cached for CACHE_TTL_SECONDS."""
+def generate_suggestions(home_id: int,
+                         *, now: datetime | None = None) -> list[dict]:
+    """LLM-generated radar suggestions. Cached for CACHE_TTL_SECONDS.
+
+    `now` is the user's current local datetime — used in the prompt's
+    "Today is …" line so seasonal/timely suggestions track the user's
+    clock. Falls back to server local time when not provided."""
     cached = _read_cache()
     if cached is not None:
         return cached
@@ -131,7 +136,8 @@ def generate_suggestions(home_id: int) -> list[dict]:
     lng = home.get("lng") or DEFAULT_LNG
     weather = get_forecast_summary(lat, lng)
 
-    now = datetime.now(timezone.utc).astimezone()
+    if now is None:
+        now = datetime.now(timezone.utc).astimezone()
     today = now.strftime("%A, %B %-d, %Y")
 
     calendar_block = (
@@ -205,12 +211,16 @@ Hard rules:
     return suggestions
 
 
-def build_radar_response(home_id: int) -> dict:
+def build_radar_response(home_id: int,
+                         *, now: datetime | None = None) -> dict:
     """Combine upcoming calendar entries + LLM suggestions for the iOS app.
 
     Calendar items: future (sorted soonest-first) followed by recurring.
     Past + observation entries are NOT included — they live in the
     profile drawer's calendar tab instead.
+
+    `now` is forwarded to suggestion generation so the LLM prompt's
+    "today" anchor tracks the user's clock.
     """
     cal = store.get_calendar(home_id)
     future = sorted(
@@ -221,7 +231,7 @@ def build_radar_response(home_id: int) -> dict:
 
     suggestions: list[dict] = []
     try:
-        suggestions = generate_suggestions(home_id)
+        suggestions = generate_suggestions(home_id, now=now)
     except Exception as e:  # noqa: BLE001
         print(f"[radar] suggestion generation failed: {e}")
 
