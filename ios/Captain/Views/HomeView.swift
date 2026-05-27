@@ -7,7 +7,12 @@ import SwiftUI
 struct HomeView: View {
     let session: FirstSessionResponse
     @EnvironmentObject var appState: AppState
-    @State private var chatPresented = false
+    /// Single source of truth for "is the chat surface open and what
+    /// draft does it open with?" — using `.fullScreenCover(item:)`
+    /// guarantees that each set creates a fresh identity, so SwiftUI
+    /// fully re-mounts ChatView with the new draft (rather than reusing
+    /// an existing instance whose @State is already initialized).
+    @State private var chatPresentation: ChatPresentation?
     @State private var profilePresented = false
     @State private var radarPresented = false
     @State private var huntPresented = false
@@ -15,6 +20,18 @@ struct HomeView: View {
     @State private var radar: RadarResponse?
     @State private var radarLoading = true
     @State private var hunt: HuntResponse?
+    /// Set by RadarView's tap callback right before it dismisses; the
+    /// sheet's onDismiss reads this to decide whether to open chat.
+    @State private var pendingChatDraft: String?
+
+    /// Identifiable wrapper so `.fullScreenCover(item:)` treats every
+    /// new chat presentation as a unique view identity. The UUID is
+    /// the key — without it, SwiftUI happily reuses the previous
+    /// ChatView instance and the pre-filled draft never lands.
+    fileprivate struct ChatPresentation: Identifiable {
+        let id = UUID()
+        let initialDraft: String?
+    }
 
 
     var body: some View {
@@ -22,15 +39,34 @@ struct HomeView: View {
             background
             content
         }
-        .fullScreenCover(isPresented: $chatPresented) {
-            ChatView(session: session)
+        .fullScreenCover(item: $chatPresentation) { presentation in
+            ChatView(
+                session: session,
+                initialDraft: presentation.initialDraft,
+            )
         }
         .sheet(isPresented: $profilePresented) {
             ProfileView(session: session)
         }
-        .sheet(isPresented: $radarPresented) {
+        .sheet(isPresented: $radarPresented, onDismiss: {
+            // If the user tapped a radar item, the closure stored a
+            // draft. Now that the radar sheet is gone, open chat with
+            // that draft — async dispatch so the sheet-dismiss
+            // animation finishes before the cover-present animation
+            // starts (sheet→cover transitions are otherwise twitchy).
+            if let draft = pendingChatDraft {
+                pendingChatDraft = nil
+                DispatchQueue.main.async {
+                    chatPresentation = ChatPresentation(
+                        initialDraft: draft,
+                    )
+                }
+            }
+        }) {
             if let radar {
-                RadarView(radar: radar)
+                RadarView(radar: radar) { draft in
+                    pendingChatDraft = draft
+                }
             }
         }
         .sheet(isPresented: $huntPresented, onDismiss: {
@@ -47,7 +83,7 @@ struct HomeView: View {
             // corresponding sheet immediately (used for screenshots).
             if args.contains("--auto-chat") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    chatPresented = true
+                    chatPresentation = ChatPresentation(initialDraft: nil)
                 }
             }
             if args.contains("--show-profile") {
@@ -87,28 +123,39 @@ struct HomeView: View {
 
     // MARK: - Content
 
+    /// Three-part layout: pinned topBlock, scrolling middle (hero +
+    /// widgets), pinned chat capsule. The middle is in a ScrollView so
+    /// the hero portrait can stay its natural full-width-square size
+    /// without competing for vertical room — on smaller phones (SE,
+    /// 17e) the user scrolls a little; on larger phones (Pro Max)
+    /// everything fits and the scroll surface barely engages.
     private var content: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(spacing: 0) {
             topBlock
-            Spacer().frame(height: 18)
-            heroImage
-            if let hunt, !hunt.complete {
-                Spacer().frame(height: 14)
-                huntBanner(hunt)
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Spacer().frame(height: 18)
+                    heroImage
+                    if let hunt, !hunt.complete {
+                        Spacer().frame(height: 14)
+                        huntBanner(hunt)
+                            .padding(.horizontal, 24)
+                    }
+                    Spacer().frame(height: 14)
+                    WeatherWidget(periods: weatherPeriods)
+                        .padding(.horizontal, 24)
+                    Spacer().frame(height: 10)
+                    RadarStrip(radar: radar, isLoading: radarLoading) {
+                        if radar != nil { radarPresented = true }
+                    }
                     .padding(.horizontal, 24)
+                    Spacer().frame(height: 12)
+                }
             }
-            Spacer().frame(height: 14)
-            WeatherWidget(periods: weatherPeriods)
-                .padding(.horizontal, 24)
-            Spacer().frame(height: 10)
-            RadarStrip(radar: radar, isLoading: radarLoading) {
-                if radar != nil { radarPresented = true }
-            }
-            .padding(.horizontal, 24)
-            Spacer(minLength: 12)
-            // Bottom chat capsule sits inline in the column now (no walnut
-            // surface beneath it) — the cream background runs unbroken
-            // from the home image all the way to the safe area.
+            // Bottom chat capsule sits inline in the column now (no
+            // walnut surface beneath it) — the cream background runs
+            // unbroken from the home image all the way to the safe
+            // area.
             chatCapsule
                 .padding(.horizontal, 20)
                 .padding(.bottom, 12)
@@ -205,12 +252,14 @@ struct HomeView: View {
             }
         }
         // maxWidth before aspectRatio so the square fills the row's
-        // available width — without this, the leading-aligned content
-        // VStack would let the image collapse to its intrinsic size
-        // and float to the left, leaving uneven cream margin on the
-        // right of the brass frame.
+        // available width. layoutPriority(1) keeps the square from
+        // shrinking when the column is vertically constrained on
+        // smaller phones (iPhone SE etc.) — without it, .fit honors
+        // the smaller of {width, height available} and the image
+        // collapses to ~40% of screen width.
         .frame(maxWidth: .infinity)
         .aspectRatio(1, contentMode: .fit)
+        .layoutPriority(1)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         // Brass picture frame — echoes the framed sunflowers reference
         .overlay(
@@ -246,10 +295,12 @@ struct HomeView: View {
                         .font(CaptainTheme.body(14, weight: .medium))
                         .foregroundStyle(CaptainTheme.textPrimary)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                     Text(huntBannerDetail(hunt))
                         .font(CaptainTheme.body(11))
                         .foregroundStyle(CaptainTheme.textMuted)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.9)
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right")
@@ -296,7 +347,7 @@ struct HomeView: View {
     /// background runs unbroken through the home screen.
     private var chatCapsule: some View {
         Button {
-            chatPresented = true
+            chatPresentation = ChatPresentation(initialDraft: nil)
         } label: {
             HStack(spacing: 12) {
                 Text("ask about your home…")

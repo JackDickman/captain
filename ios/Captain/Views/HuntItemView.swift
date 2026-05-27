@@ -193,6 +193,7 @@ struct HuntItemView: View {
                 .font(CaptainTheme.display(24))
                 .foregroundStyle(CaptainTheme.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
+                .minimumScaleFactor(0.85)
             Text(item.description)
                 .font(CaptainTheme.body(14))
                 .foregroundStyle(CaptainTheme.textMuted)

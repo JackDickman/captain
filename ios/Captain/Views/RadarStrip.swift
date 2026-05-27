@@ -78,16 +78,21 @@ struct RadarStrip: View {
     private func summaryRow(_ r: RadarResponse) -> some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
+                // Allow up to 2 lines + downscale rather than truncating
+                // mid-word on smaller phones — the lead can be longer
+                // than the category-dots cluster leaves room for.
                 Text(leadLine(r))
                     .font(CaptainTheme.body(14, weight: .medium))
                     .foregroundStyle(CaptainTheme.textPrimary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.9)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let detail = detailLine(r) {
                     Text(detail)
                         .font(CaptainTheme.body(11))
                         .foregroundStyle(CaptainTheme.textMuted)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.9)
                 }
             }
             Spacer(minLength: 8)
@@ -171,11 +176,13 @@ struct RadarStrip: View {
                 .foregroundStyle(CaptainTheme.brass)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 1) {
+                // LLM suggestion titles can be long; wrap rather than
+                // truncate mid-word on narrow phones.
                 Text(p.title)
                     .font(CaptainTheme.body(13, weight: .medium))
                     .foregroundStyle(CaptainTheme.textPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 if !p.when.isEmpty {
                     Text(p.when.lowercased())
                         .font(CaptainTheme.body(11))

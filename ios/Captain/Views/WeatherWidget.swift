@@ -40,6 +40,10 @@ struct WeatherWidget: View {
                 }
             }
         }
+        // Defensive maxWidth so the widget always fills its row inside
+        // the home-screen leading-aligned content VStack — without it,
+        // dayColumns might not propose enough width to stretch the HStack.
+        .frame(maxWidth: .infinity)
         .frame(height: 96)
         .background(
             RoundedRectangle(cornerRadius: 14)

@@ -6,6 +6,13 @@ import SwiftUI
 /// (AI suggestions, each with title + reason + timeframe + category).
 struct RadarView: View {
     let radar: RadarResponse
+    /// Called when the user taps a calendar item or suggestion card.
+    /// The closure receives a contextual draft string the parent uses
+    /// to open the chat surface pre-filled. RadarView dismisses itself
+    /// immediately on tap; the parent's sheet onDismiss hook is the
+    /// natural place to then present the chat.
+    var onTapItem: ((String) -> Void)? = nil
+
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -15,11 +22,24 @@ struct RadarView: View {
                 header
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
+                        // One-line affordance hint — tells the user
+                        // that tapping any item starts a chat. Quiet
+                        // by default so it doesn't dominate.
+                        if !radar.calendarItems.isEmpty || !radar.suggestions.isEmpty {
+                            Text("Tap any item to chat about it.")
+                                .font(CaptainTheme.body(12))
+                                .foregroundStyle(CaptainTheme.textMuted)
+                        }
                         if !radar.calendarItems.isEmpty {
                             sectionHeading("Coming up")
                             VStack(spacing: 10) {
                                 ForEach(radar.calendarItems) { entry in
-                                    calendarRow(entry)
+                                    Button {
+                                        handleTap(draft: chatDraft(forCalendar: entry))
+                                    } label: {
+                                        calendarRow(entry)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                         }
@@ -27,7 +47,12 @@ struct RadarView: View {
                             sectionHeading("Things to consider")
                             VStack(spacing: 10) {
                                 ForEach(radar.suggestions) { s in
-                                    suggestionCard(s)
+                                    Button {
+                                        handleTap(draft: chatDraft(forSuggestion: s))
+                                    } label: {
+                                        suggestionCard(s)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                         }
@@ -70,6 +95,31 @@ struct RadarView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(CaptainTheme.cream)
+    }
+
+    // MARK: - Tap handling
+
+    /// Forwards the contextual chat draft to the parent and dismisses
+    /// the radar sheet. The parent (HomeView) listens on the sheet's
+    /// onDismiss hook to then open the chat full-screen cover with the
+    /// stored draft.
+    private func handleTap(draft: String) {
+        onTapItem?(draft)
+        dismiss()
+    }
+
+    /// Contextual chat starter for a calendar entry — natural prose
+    /// the user can extend or replace. Uses the entry's text verbatim
+    /// inside quotes so Captain knows what's being referenced.
+    private func chatDraft(forCalendar entry: CalendarEntry) -> String {
+        "About \"\(entry.text)\" — "
+    }
+
+    /// Same for an AI suggestion. References the title (not the
+    /// reason) so the draft stays short and the user can add their
+    /// own framing.
+    private func chatDraft(forSuggestion s: RadarSuggestion) -> String {
+        "About the idea to \(s.title.lowercased()) — "
     }
 
     private var totalLabel: String {
@@ -161,6 +211,10 @@ struct RadarView: View {
                 }
             }
         }
+        // Defensive maxWidth: without it, a very short reason text
+        // could let the card collapse to its content width inside the
+        // leading-aligned section VStack.
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .background(

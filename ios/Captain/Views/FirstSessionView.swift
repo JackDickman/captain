@@ -98,35 +98,39 @@ struct FirstSessionView: View {
     }
 
     private var photoPickerView: some View {
+        // Square picker that scales with the screen: caps at 300pt on
+        // larger phones so it doesn't feel oversized, but shrinks to
+        // fit on smaller ones via the outer horizontal padding. The
+        // ZStack lets the same frame host either the placeholder or
+        // the loaded photo without repeating the geometry.
         PhotosPicker(selection: $photoItem, matching: .images) {
             ZStack {
                 if let photoData, let img = UIImage(data: photoData) {
                     Image(uiImage: img)
                         .resizable()
                         .scaledToFill()
-                        .frame(width: 260, height: 260)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                        // Brass frame — echoes the framed art in the kitchen ref
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14)
-                                .strokeBorder(CaptainTheme.brass, lineWidth: 3)
-                        )
-                        .mcmShadow()
                 } else {
-                    RoundedRectangle(cornerRadius: 14)
-                        .fill(CaptainTheme.creamDeep)
-                        .frame(width: 260, height: 260)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14)
-                                .strokeBorder(
-                                    CaptainTheme.walnut.opacity(0.35),
-                                    style: StrokeStyle(lineWidth: 1.5, dash: [6, 4])
-                                )
-                        )
-                        .overlay(placeholderInner)
-                        .mcmShadow(intensity: 0.5)
+                    CaptainTheme.creamDeep
+                    placeholderInner
                 }
             }
+            .aspectRatio(1, contentMode: .fit)
+            .frame(maxWidth: 300)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(
+                        photoData != nil
+                            ? CaptainTheme.brass
+                            : CaptainTheme.walnut.opacity(0.35),
+                        style: StrokeStyle(
+                            lineWidth: photoData != nil ? 3 : 1.5,
+                            dash: photoData != nil ? [] : [6, 4]
+                        )
+                    )
+            )
+            .mcmShadow(intensity: photoData != nil ? 1.0 : 0.5)
+            .padding(.horizontal, 32)
         }
         .onChange(of: photoItem) { _, newValue in
             Task { @MainActor in

@@ -6,6 +6,13 @@ import SwiftUI
 /// attached images as a horizontal strip above the text.
 struct ChatView: View {
     let session: FirstSessionResponse
+    /// Text the chat input opens pre-filled with. Lets callers (e.g.
+    /// a radar item tap) hand the user a contextual starter they can
+    /// append to or replace. PRD §7.6 anticipates this: "When chat is
+    /// opened from a specific context (a calendar entry, a profile
+    /// field, a radar item), the input is context-aware…"
+    var initialDraft: String? = nil
+
     @Environment(\.dismiss) private var dismiss
 
     @State private var messages: [ChatMessage] = []
@@ -40,6 +47,20 @@ struct ChatView: View {
             }
         }
         .task { await loadMessages() }
+        .onAppear {
+            // If a caller passed in a pre-filled draft (e.g. tap from
+            // a radar item), seed the input and focus it so the user
+            // can keep typing right after the contextual starter.
+            // Done in onAppear (not init) because SwiftUI may reuse a
+            // ChatView instance across fullScreenCover presentations
+            // and not call init — onAppear is the reliable hook.
+            if let starter = initialDraft, !starter.isEmpty {
+                draft = starter
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    inputFocused = true
+                }
+            }
+        }
     }
 
     // MARK: - Header (the home, receded)
