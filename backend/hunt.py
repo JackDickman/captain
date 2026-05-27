@@ -21,8 +21,58 @@ are always shown.
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
+
+from openai import OpenAI
+
+
+# Vision extraction over uploaded docs. Mini gives us solid OCR + spatial
+# reasoning over multi-page inspection reports without the cost of full
+# models. Swappable per env var.
+DOCS_MODEL = os.getenv("CAPTAIN_DOCS_MODEL", "gpt-5.4-mini")
+
+
+# Structured-output schema for /hunt/documents extraction. We ask the
+# model for an array of {item_id, notes} pairs — items where it found
+# nothing useful are simply omitted, no "null notes" filler.
+DOC_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "extractions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": (
+                            "Must exactly match one of the item ids "
+                            "listed in the prompt."
+                        ),
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": (
+                            "Concise one-sentence summary of what the "
+                            "documents say about this item. Include "
+                            "specifics (brand, model, year, capacity, "
+                            "location) when present."
+                        ),
+                    },
+                },
+                "required": ["item_id", "notes"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["extractions"],
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +93,18 @@ class HuntItem:
     # Applicability rule. Receives current state ({item_id: notes}).
     # None = always shown.
     show_if: Callable[[dict[str, str]], bool] | None = None
+    # Lowercase keywords used for "already-known" suppression — if any
+    # appear in home.md (case-insensitive substring match), Captain
+    # suggests it already has this info and asks the user to confirm
+    # rather than walking through from scratch. Defaults to empty (no
+    # auto-detection — user fills in normally).
+    profile_keywords: tuple[str, ...] = ()
+    # Short hint Captain prepends to the LLM extraction prompt when
+    # scanning uploaded documents. Tells the model what to look for in
+    # an inspection report / disclosure / closing docs for this item.
+    # Empty means "skip this item during doc extraction" — used for
+    # truly personal items (household composition, talking style).
+    docs_hint: str = ""
 
 
 # -------- applicability helpers --------
@@ -92,6 +154,12 @@ ITEMS: list[HuntItem] = [
             "looks right\" is fine.)"
         ),
         placeholder="e.g. \"1962, not 1965; we finished the attic in 2023\"",
+        # Year built and sqft are usually surfaced in first-session, so
+        # home.md mention is expected — we don't suppress on these.
+        docs_hint=(
+            "Year built, square footage, lot size, bedrooms/bathrooms — "
+            "usually on the first page of an inspection report."
+        ),
     ),
     HuntItem(
         id="heat_source",
@@ -104,6 +172,15 @@ ITEMS: list[HuntItem] = [
             "heat pump, or other?"
         ),
         placeholder="e.g. \"natural gas forced-air furnace; wood stove in the den\"",
+        profile_keywords=(
+            "heat pump", "natural gas", "gas furnace", "oil furnace",
+            "oil heat", "electric heat", "baseboard", "boiler",
+            "radiant", "wood stove", "propane",
+        ),
+        docs_hint=(
+            "Heating system type (furnace / boiler / heat pump), fuel "
+            "(gas, oil, electric, propane), and any notes on age."
+        ),
     ),
     HuntItem(
         id="water_source",
@@ -113,6 +190,14 @@ ITEMS: list[HuntItem] = [
         has_photo=False,
         question_prompt="On city/municipal water, or a well?",
         placeholder="e.g. \"city water\" or \"private well, pressure tank in basement\"",
+        profile_keywords=(
+            "well water", "private well", "city water", "municipal water",
+            "pressure tank",
+        ),
+        docs_hint=(
+            "Water supply — municipal vs. private well. Inspection "
+            "reports usually call this out on the plumbing page."
+        ),
     ),
     HuntItem(
         id="sewer_type",
@@ -125,6 +210,13 @@ ITEMS: list[HuntItem] = [
             "when was it last pumped, if you know?"
         ),
         placeholder="e.g. \"septic, tank near the back fence, pumped 2023\"",
+        profile_keywords=(
+            "septic", "city sewer", "municipal sewer", "leach field",
+        ),
+        docs_hint=(
+            "Sewer / septic — type, and if septic, tank location and "
+            "last pump date when noted."
+        ),
     ),
     HuntItem(
         id="has_basement",
@@ -136,6 +228,13 @@ ITEMS: list[HuntItem] = [
             "Full basement? Partial? Crawl space? Slab? Some mix?"
         ),
         placeholder="e.g. \"full basement, partially finished\"",
+        profile_keywords=(
+            "basement", "crawl space", "crawlspace", "slab", "cellar",
+        ),
+        docs_hint=(
+            "Foundation type — basement (full / partial / finished), "
+            "crawl space, slab, or some combination."
+        ),
     ),
 
     # ----- Safety essentials -----
@@ -156,6 +255,12 @@ ITEMS: list[HuntItem] = [
         ),
         question_prompt="Briefly, where is it?",
         placeholder="e.g. \"basement utility room, behind the laundry tub\"",
+        # Inspection reports rarely note the location precisely — but
+        # they sometimes describe valve type / condition.
+        docs_hint=(
+            "Main water shutoff — location notes, valve type "
+            "(ball / gate), or any condition notes."
+        ),
     ),
     HuntItem(
         id="gas_shutoff",
@@ -174,6 +279,10 @@ ITEMS: list[HuntItem] = [
         question_prompt="Where's the meter?",
         placeholder="e.g. \"south side, by the AC condenser\"",
         show_if=_heat_uses_gas,
+        docs_hint=(
+            "Gas meter / shutoff location notes from the inspection's "
+            "exterior or gas-system section."
+        ),
     ),
     HuntItem(
         id="electrical_panel",
@@ -190,6 +299,15 @@ ITEMS: list[HuntItem] = [
         ),
         question_prompt="Anything labeled? Any breakers you don't know what they control?",
         placeholder="e.g. \"labels are illegible from the previous owner — need to redo them\"",
+        profile_keywords=(
+            "breaker box", "electrical panel", "service panel",
+            "main panel", "amp service", "amperage",
+        ),
+        docs_hint=(
+            "Electrical panel — main amperage (100A / 200A), brand "
+            "(Square D, FPE, Zinsco, etc.), number of breakers, any "
+            "noted issues (FPE recalls, double-tapping, rust)."
+        ),
     ),
     HuntItem(
         id="smoke_co_detectors",
@@ -202,6 +320,10 @@ ITEMS: list[HuntItem] = [
             "they are? (10 years is typical lifespan.)"
         ),
         placeholder="e.g. \"every hallway + basement near the stairs; replaced when we moved in 2024\"",
+        docs_hint=(
+            "Smoke and CO detectors — how many, where (every bedroom, "
+            "every floor), and the inspector's notes on age or function."
+        ),
     ),
     HuntItem(
         id="sump_pump",
@@ -219,6 +341,13 @@ ITEMS: list[HuntItem] = [
         question_prompt="Battery backup? Any history of issues?",
         placeholder="e.g. \"no backup; runs heavily in spring\"",
         show_if=_has_basement,
+        profile_keywords=(
+            "sump pump", "sump pit", "battery backup",
+        ),
+        docs_hint=(
+            "Sump pump — presence, age, battery backup, any noted "
+            "issues (cycling, sticking, dry pit)."
+        ),
     ),
 
     # ----- Mechanicals -----
@@ -237,6 +366,15 @@ ITEMS: list[HuntItem] = [
         ),
         question_prompt="If the filter size is visible, what is it? When was it last changed?",
         placeholder="e.g. \"16x25x1; replaced last month\"",
+        profile_keywords=(
+            "hvac", "furnace", "air handler", "air conditioner",
+            "ac unit", "merv", "filter size",
+        ),
+        docs_hint=(
+            "HVAC / furnace / AC — brand (Carrier, Trane, Lennox, Goodman, "
+            "etc.), model, install year, filter size, condition. Heat "
+            "pumps too."
+        ),
     ),
     HuntItem(
         id="water_heater",
@@ -253,6 +391,14 @@ ITEMS: list[HuntItem] = [
         ),
         question_prompt="Tank or tankless? Rough age, if you know?",
         placeholder="e.g. \"50-gal gas tank, installed 2018\"",
+        profile_keywords=(
+            "water heater", "hot water heater", "tankless", "tank water",
+        ),
+        docs_hint=(
+            "Water heater — type (tank / tankless / heat pump), brand, "
+            "capacity (gallons), fuel (gas / electric), install year, "
+            "any noted condition."
+        ),
     ),
     HuntItem(
         id="thermostat",
@@ -265,6 +411,14 @@ ITEMS: list[HuntItem] = [
         has_photo=False,
         question_prompt="What kind do you have? Brand/model if you know it.",
         placeholder="e.g. \"Nest 3rd gen\" or \"plain dial thermostat from the 80s\"",
+        profile_keywords=(
+            "thermostat", "nest", "ecobee", "honeywell thermostat",
+            "smart thermostat",
+        ),
+        docs_hint=(
+            "Thermostat — type (smart / programmable / dial), brand if "
+            "noted."
+        ),
     ),
 
     # ----- Worth knowing (the first-timer wins) -----
@@ -285,6 +439,12 @@ ITEMS: list[HuntItem] = [
         ),
         question_prompt="Where is it? Any markings?",
         placeholder="e.g. \"back of the garage, by the AC condenser\"",
+        # Inspection reports usually note the cleanout in the plumbing
+        # section when accessible.
+        docs_hint=(
+            "Sewer cleanout — location, accessibility, any notes from "
+            "the plumbing section."
+        ),
     ),
     HuntItem(
         id="dryer_vent_path",
@@ -301,6 +461,10 @@ ITEMS: list[HuntItem] = [
             "Any sense of how long the run is?"
         ),
         placeholder="e.g. \"first-floor laundry, vents out the side wall ~5 ft away\"",
+        docs_hint=(
+            "Dryer vent — location of laundry, vent exit, any noted "
+            "issues (long run, kinks, lint buildup)."
+        ),
     ),
     HuntItem(
         id="gfci_outlets",
@@ -317,6 +481,11 @@ ITEMS: list[HuntItem] = [
             "one resets others)?"
         ),
         placeholder="e.g. \"kitchen, both baths, garage; the garage one trips the outside outlet too\"",
+        docs_hint=(
+            "GFCI outlets — inspectors test these, so the electrical "
+            "section often lists which areas have them and which "
+            "should but don't."
+        ),
     ),
 
     # ----- About you -----
@@ -372,3 +541,139 @@ def applicable_items(state: dict[str, str]) -> list[HuntItem]:
         item for item in ITEMS
         if item.show_if is None or item.show_if(state)
     ]
+
+
+def profile_mentions(item: HuntItem, home_md: str) -> str | None:
+    """If any of `item.profile_keywords` appear in `home_md` (case-
+    insensitive substring match), return the first ~120 characters of
+    surrounding context. Caller surfaces this as a "Captain seems to
+    know this already" hint on the item.
+
+    Returns None when there's no match or the item has no keywords."""
+    if not item.profile_keywords or not home_md:
+        return None
+    low = home_md.lower()
+    for kw in item.profile_keywords:
+        idx = low.find(kw)
+        if idx < 0:
+            continue
+        # Snip the matched span + some surrounding context, trimmed to
+        # avoid pulling in markdown noise on either side.
+        start = max(0, idx - 40)
+        end = min(len(home_md), idx + len(kw) + 80)
+        snippet = home_md[start:end].strip()
+        # Collapse newlines and excessive whitespace so the hint sits
+        # as one inline line in the UI.
+        snippet = " ".join(snippet.split())
+        # Ellipsis hints when we trimmed.
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(home_md) else ""
+        return f"{prefix}{snippet}{suffix}"
+    return None
+
+
+def docs_extraction_items() -> list[HuntItem]:
+    """Items eligible for being auto-filled by uploaded documents — i.e.
+    those that have a non-empty docs_hint. Personal items
+    (household_composition, your_style) deliberately opt out."""
+    return [item for item in ITEMS if item.docs_hint]
+
+
+def _build_docs_prompt() -> str:
+    """Construct the system prompt for the document-extraction LLM call.
+    Enumerates every item eligible for doc auto-fill alongside its hint,
+    then sets the conservatism bar (only return what's explicitly in
+    the docs)."""
+    item_lines = "\n".join(
+        f"- `{item.id}` ({item.title}): {item.docs_hint}"
+        for item in docs_extraction_items()
+    )
+    return (
+        "You're extracting structured information from documents a "
+        "homeowner just uploaded — typically an inspection report, "
+        "seller's property disclosure, closing docs, or appliance "
+        "manuals. Captain will use what you extract to pre-fill items "
+        "in a guided home tour so the user can confirm rather than "
+        "answer from scratch.\n\n"
+        "BE CONSERVATIVE. Only return items where the documents "
+        "EXPLICITLY state an answer. Don't infer, generalize, or guess. "
+        "If a category isn't covered in the documents, OMIT it from "
+        "your response — the user will fill those in manually.\n\n"
+        "For each returned item, `notes` should be a concise one-sentence "
+        "summary in plain language, including specifics (brand, model, "
+        "install year, capacity, fuel, location) when the documents "
+        "include them.\n\n"
+        "NEVER return:\n"
+        " - prices, costs, or dollar figures (Captain deliberately "
+        "avoids financial framing)\n"
+        " - personal information about prior owners\n"
+        " - speculative repairs the inspector merely flagged\n\n"
+        "Items you may return (use the exact id):\n"
+        f"{item_lines}"
+    )
+
+
+def extract_from_documents(
+    client: OpenAI, photo_paths: list[Path],
+) -> list[dict]:
+    """Send all uploaded document photos to the vision LLM and ask for
+    structured extractions. Returns a list of {item_id, notes} dicts —
+    only items where the model found real info. Errors and malformed
+    responses return an empty list (graceful degradation; the user can
+    still fill items in manually).
+    """
+    if not photo_paths:
+        return []
+
+    content: list[dict] = [
+        {"type": "text", "text": _build_docs_prompt()},
+    ]
+    for p in photo_paths:
+        try:
+            raw = p.read_bytes()
+        except OSError as e:
+            print(f"[hunt-docs] couldn't read {p}: {e}")
+            continue
+        suffix = p.suffix.lower().lstrip(".")
+        mime = "jpeg" if suffix == "jpg" else suffix
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": (
+                    f"data:image/{mime};base64,"
+                    f"{base64.b64encode(raw).decode()}"
+                ),
+            },
+        })
+
+    if len(content) == 1:
+        # All images failed to read.
+        return []
+
+    try:
+        resp = client.chat.completions.create(
+            model=DOCS_MODEL,
+            messages=[{"role": "user", "content": content}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "hunt_doc_extraction",
+                    "schema": DOC_EXTRACTION_SCHEMA,
+                    "strict": True,
+                },
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[hunt-docs] LLM call failed: {e}")
+        return []
+
+    try:
+        payload = json.loads(resp.choices[0].message.content or "{}")
+        extractions = payload.get("extractions") or []
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        print(f"[hunt-docs] response parse failed: {e}")
+        return []
+
+    print(f"[hunt-docs] extracted {len(extractions)} item(s) from "
+          f"{len(photo_paths)} document(s)")
+    return extractions

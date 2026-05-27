@@ -25,6 +25,7 @@ backend/captain.db-*
 backend/rendered/
 backend/chat-photos/
 backend/hunt-photos/
+backend/hunt-documents/
 backend/cache/
 
 # iOS — Xcode project is regenerated from project.yml via xcodegen

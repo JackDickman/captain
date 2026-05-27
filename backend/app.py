@@ -69,6 +69,8 @@ CHAT_PHOTOS_DIR = Path(__file__).parent / "chat-photos"
 CHAT_PHOTOS_DIR.mkdir(exist_ok=True)
 HUNT_PHOTOS_DIR = Path(__file__).parent / "hunt-photos"
 HUNT_PHOTOS_DIR.mkdir(exist_ok=True)
+HUNT_DOCUMENTS_DIR = Path(__file__).parent / "hunt-documents"
+HUNT_DOCUMENTS_DIR.mkdir(exist_ok=True)
 
 # Initialise SQLite schema + markdown profile files on import so the very
 # first request can hit them without a migration step.
@@ -1029,17 +1031,35 @@ def delete_calendar_entry(entry_id: int) -> dict:
 def _hunt_state_payload(home_id: int) -> dict:
     """Build the payload returned by /hunt: applicable items resolved
     against current progress + branch-question state. Items are returned
-    in catalog order so the iOS list preserves category grouping."""
+    in catalog order so the iOS list preserves category grouping.
+
+    Also surfaces `notes_source` (where any pre-fill came from) and
+    `profile_hint` (a snippet from home.md when Captain seems to already
+    know this item from prior chats) so iOS can render the right badge."""
     progress = store.get_hunt_progress(home_id)
     state = hunt_mod.state_from_progress(progress)
     visible = hunt_mod.applicable_items(state)
+    home_md = profiles.read_home_md()
 
     progress_by_id = {p["item_id"]: p for p in progress}
 
     items: list[dict] = []
+    prefilled = 0
     for item in visible:
         p = progress_by_id.get(item.id)
         status = (p or {}).get("status") or "pending"
+        notes_source = (p or {}).get("notes_source")
+        if notes_source == "documents" and status == "pending":
+            prefilled += 1
+
+        # Already-known suppression: scan home.md for any keyword the
+        # item declares. Only surface the hint when the item hasn't
+        # been resolved AND we don't already have a pre-fill from docs
+        # (no double-badging — the doc pre-fill is the stronger signal).
+        profile_hint: str | None = None
+        if status == "pending" and notes_source != "documents":
+            profile_hint = hunt_mod.profile_mentions(item, home_md)
+
         items.append({
             "id": item.id,
             "title": item.title,
@@ -1051,6 +1071,8 @@ def _hunt_state_payload(home_id: int) -> dict:
             "placeholder": item.placeholder,
             "status": status,
             "notes": (p or {}).get("notes"),
+            "notes_source": notes_source,
+            "profile_hint": profile_hint,
             "photo_url": (p or {}).get("photo_url"),
             "completed_at": (p or {}).get("completed_at"),
         })
@@ -1065,6 +1087,7 @@ def _hunt_state_payload(home_id: int) -> dict:
         "total": len(items),
         "done": done,
         "resolved": resolved,
+        "prefilled": prefilled,
         "complete": resolved >= len(items) and len(items) > 0,
     }
 
@@ -1184,6 +1207,85 @@ def na_hunt_item(item_id: str) -> dict:
         raise HTTPException(400, "no home yet")
     store.upsert_hunt_item(home["id"], item_id, "not_applicable")
     return _hunt_state_payload(home["id"])
+
+
+@app.post("/hunt/documents")
+async def upload_hunt_documents(
+    photos: Annotated[List[UploadFile], File()],
+) -> dict:
+    """Pre-fill hunt items from a batch of document photos the user just
+    uploaded (inspection report, seller's disclosure, closing docs,
+    appliance manuals). Sends all photos to a vision LLM in one call,
+    parses structured extractions, and creates pending hunt items with
+    notes_source="documents" for each one the model could fill.
+
+    User-facing flow: dropped onto the tour at the start as "Got docs?
+    Upload them now to skip ahead." Items pre-filled this way still
+    require user confirmation — the user reviews each, tweaks if needed,
+    and taps save. Captain never marks a doc-derived item done without
+    user action."""
+    home = store.get_home()
+    if not home:
+        raise HTTPException(400, "no home yet — finish first-session first")
+    if not photos:
+        raise HTTPException(400, "at least one document photo required")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(500, "OPENAI_API_KEY missing on backend")
+
+    home_dir = HUNT_DOCUMENTS_DIR / str(home["id"])
+    home_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[Path] = []
+    for p in photos:
+        if not getattr(p, "filename", ""):
+            continue
+        suffix = (
+            Path(p.filename or "upload.jpg").suffix.lower() or ".jpg"
+        )
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            raise HTTPException(400, f"unsupported format: {suffix}")
+        fname = f"{uuid.uuid4().hex}{suffix}"
+        path = home_dir / fname
+        with open(path, "wb") as f:
+            shutil.copyfileobj(p.file, f)
+        saved_paths.append(path)
+
+    if not saved_paths:
+        raise HTTPException(400, "no valid document photos uploaded")
+
+    client = OpenAI()
+    try:
+        extractions = hunt_mod.extract_from_documents(client, saved_paths)
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        raise HTTPException(500, f"extraction failed: {e}") from e
+
+    # Persist each non-empty extraction as a pending item with
+    # notes_source="documents". Skip items already done — the user has
+    # spoken, and the doc pre-fill is only useful for items they
+    # haven't tackled yet.
+    valid_ids = set(hunt_mod.ITEMS_BY_ID.keys())
+    applied = 0
+    for ext in extractions:
+        item_id = (ext.get("item_id") or "").strip()
+        notes = (ext.get("notes") or "").strip()
+        if not item_id or item_id not in valid_ids or not notes:
+            continue
+        existing = store.get_hunt_item(home["id"], item_id)
+        if existing and existing.get("status") == "done":
+            continue
+        store.upsert_hunt_item(
+            home["id"], item_id, "pending",
+            notes=notes, notes_source="documents",
+        )
+        applied += 1
+
+    print(f"[hunt-docs] applied {applied} extraction(s) to "
+          f"home {home['id']}")
+    state = _hunt_state_payload(home["id"])
+    state["docs_processed"] = len(saved_paths)
+    state["docs_applied"] = applied
+    return state
 
 
 @app.post("/hunt/{item_id}/reset")

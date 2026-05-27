@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS hunt_progress (
     home_id INTEGER NOT NULL,
     item_id TEXT NOT NULL,
     status TEXT NOT NULL,         -- pending | done | skipped | not_applicable
-    notes TEXT,                   -- user's captured text answer
+    notes TEXT,                   -- user's captured text answer (or pre-fill)
+    notes_source TEXT,            -- NULL | "documents" | "profile" — where pre-fill came from
     photo_url TEXT,               -- relative URL of the captured photo
     completed_at REAL,            -- unix epoch when status became 'done'
     UNIQUE(home_id, item_id),
@@ -124,6 +125,7 @@ def init_db() -> None:
             "ALTER TABLE messages ADD COLUMN image_urls TEXT",
             "ALTER TABLE messages ADD COLUMN product_picks TEXT",
             "ALTER TABLE messages ADD COLUMN searches TEXT",
+            "ALTER TABLE hunt_progress ADD COLUMN notes_source TEXT",
         ]:
             try:
                 c.execute(ddl)
@@ -422,7 +424,8 @@ def get_hunt_progress(home_id: int) -> list[dict]:
     """All hunt rows for this home (any status). Caller filters."""
     with connect() as c:
         rows = c.execute(
-            """SELECT item_id, status, notes, photo_url, completed_at
+            """SELECT item_id, status, notes, notes_source,
+                      photo_url, completed_at
                FROM hunt_progress WHERE home_id = ?""",
             (home_id,),
         ).fetchall()
@@ -432,7 +435,8 @@ def get_hunt_progress(home_id: int) -> list[dict]:
 def get_hunt_item(home_id: int, item_id: str) -> dict | None:
     with connect() as c:
         row = c.execute(
-            """SELECT item_id, status, notes, photo_url, completed_at
+            """SELECT item_id, status, notes, notes_source,
+                      photo_url, completed_at
                FROM hunt_progress
                WHERE home_id = ? AND item_id = ?""",
             (home_id, item_id),
@@ -443,22 +447,31 @@ def get_hunt_item(home_id: int, item_id: str) -> dict | None:
 def upsert_hunt_item(
     home_id: int, item_id: str, status: str,
     *, notes: str | None = None, photo_url: str | None = None,
+    notes_source: str | None = None,
 ) -> None:
     """Insert or update a single item's progress. Status 'done' stamps
     completed_at; other transitions leave it alone (so re-skipping a
-    previously-done item still records the original completion time)."""
+    previously-done item still records the original completion time).
+
+    `notes_source` is preserved across status updates unless explicitly
+    overwritten — when the user confirms a pre-filled item, we keep
+    the provenance so iOS can keep showing the "from your docs" badge."""
     now = time.time() if status == "done" else None
     with connect() as c:
         # Pull existing row to preserve photo_url / notes / completed_at
-        # when callers update partial fields.
+        # / notes_source when callers update partial fields.
         existing = c.execute(
-            """SELECT notes, photo_url, completed_at
+            """SELECT notes, notes_source, photo_url, completed_at
                FROM hunt_progress
                WHERE home_id = ? AND item_id = ?""",
             (home_id, item_id),
         ).fetchone()
         if existing:
             keep_notes = notes if notes is not None else existing["notes"]
+            keep_source = (
+                notes_source if notes_source is not None
+                else existing["notes_source"]
+            )
             keep_photo = (
                 photo_url if photo_url is not None else existing["photo_url"]
             )
@@ -467,21 +480,24 @@ def upsert_hunt_item(
             )
             c.execute(
                 """UPDATE hunt_progress
-                   SET status = ?, notes = ?, photo_url = ?,
-                       completed_at = ?
+                   SET status = ?, notes = ?, notes_source = ?,
+                       photo_url = ?, completed_at = ?
                    WHERE home_id = ? AND item_id = ?""",
                 (
-                    status, keep_notes, keep_photo, keep_completed,
-                    home_id, item_id,
+                    status, keep_notes, keep_source, keep_photo,
+                    keep_completed, home_id, item_id,
                 ),
             )
         else:
             c.execute(
                 """INSERT INTO hunt_progress
-                     (home_id, item_id, status, notes, photo_url,
-                      completed_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (home_id, item_id, status, notes, photo_url, now),
+                     (home_id, item_id, status, notes, notes_source,
+                      photo_url, completed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    home_id, item_id, status, notes, notes_source,
+                    photo_url, now,
+                ),
             )
 
 

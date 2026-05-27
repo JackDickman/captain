@@ -50,6 +50,10 @@ struct HuntItemView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
                         intro
+                        // Pre-fill provenance banner — when the notes
+                        // field has come from somewhere other than the
+                        // user (docs scan or profile match), tell them.
+                        if let banner = prefillBanner { banner }
                         if item.hasPhoto { photoBlock }
                         questionBlock
                         if let errorMessage {
@@ -109,6 +113,73 @@ struct HuntItemView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(CaptainTheme.cream)
+    }
+
+    /// Returns a banner when this item came in with a pre-fill from
+    /// somewhere — docs upload, or a match Captain found in home.md.
+    /// Nil when there's nothing special to call out (fresh item, or
+    /// already done by the user).
+    @ViewBuilder
+    private var prefillBanner: AnyView? {
+        if item.notesSource == "documents" && item.status == "pending" {
+            return AnyView(
+                prefillCard(
+                    icon: "doc.text.viewfinder",
+                    title: "From your documents",
+                    body:
+                        "Captain pulled this from the docs you uploaded. "
+                        + "Tweak if needed, then save to confirm."
+                )
+            )
+        }
+        if let hint = item.profileHint, item.status == "pending" {
+            return AnyView(
+                prefillCard(
+                    icon: "sparkles",
+                    title: "Captain seems to know this already",
+                    body:
+                        "From earlier conversations: \"\(hint)\"\nConfirm or update."
+                )
+            )
+        }
+        return nil
+    }
+
+    private func prefillCard(
+        icon: String, title: String, body: String,
+    ) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(CaptainTheme.brass)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(CaptainTheme.label(10))
+                    .foregroundStyle(CaptainTheme.brass)
+                    .tracking(1.0)
+                    .textCase(.uppercase)
+                Text(body)
+                    .font(CaptainTheme.body(13))
+                    .foregroundStyle(CaptainTheme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(CaptainTheme.brass.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(
+                            CaptainTheme.brass.opacity(0.45),
+                            lineWidth: 1
+                        )
+                )
+        )
     }
 
     private var intro: some View {

@@ -534,6 +534,56 @@ enum CaptainAPI {
         }
     }
 
+    /// POST /hunt/documents — upload one or more document photos for
+    /// the backend to extract pre-fill answers from. Returns the full
+    /// updated hunt state (with prefilled count + docs counters).
+    /// Vision extraction is slow; allow up to 120s.
+    static func uploadHuntDocuments(
+        _ photos: [Data],
+    ) async throws -> HuntResponse {
+        let url = baseURL.appendingPathComponent("hunt/documents")
+        let boundary = "Boundary-\(UUID().uuidString)"
+
+        var request = makeRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        // Multi-page inspection reports + vision model = real latency.
+        // Keep generous; the iOS UI shows progress while we wait.
+        request.timeoutInterval = 180
+
+        var body = Data()
+        func appendString(_ s: String) {
+            body.append(s.data(using: .utf8)!)
+        }
+        for (i, photo) in photos.enumerated() {
+            // Documents need more legibility than chat photos — keep
+            // the long edge higher so dense inspection-report text
+            // survives the upload.
+            let compressed = compressForUpload(photo, maxDim: 2000)
+            appendString("--\(boundary)\r\n")
+            appendString(
+                "Content-Disposition: form-data; name=\"photos\"; " +
+                "filename=\"doc-\(i).jpg\"\r\n"
+            )
+            appendString("Content-Type: image/jpeg\r\n\r\n")
+            body.append(compressed)
+            appendString("\r\n")
+        }
+        appendString("--\(boundary)--\r\n")
+        request.httpBody = body
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.expectOK(response, data)
+        do {
+            return try JSONDecoder().decode(HuntResponse.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
     /// POST /hunt/{id}/skip — set status to skipped.
     static func skipHuntItem(_ itemId: String) async throws -> HuntResponse {
         try await huntAction(itemId, action: "skip")
