@@ -448,6 +448,22 @@ Open questions worth a real prototype before committing:
 - Should saved visualizations be public-ish (e.g., shareable with a spouse or a contractor as part of a quote-request) or strictly private?
 - Pricing/cost framing: the PRD's "no financial stress surfaces" rule (§5) probably means the rendering itself never quotes a dollar figure, but the conversation around it can still help the user think about what to budget for.
 
+### 11.10 Multiple people on one home
+
+Homes are usually cared for by more than one person — spouses or partners, roommates, adult kids living at home, an in-law unit, a property manager helping out. v1 assumes a single owner per home (§3, §6.4); a future iteration should let a household share the same Captain so the home's profile, calendar, and chat history are common ground.
+
+What makes this hard the right way:
+
+- **The home profile is shared; the personal profile is not.** Two people in the same home need *one* home story — same calendar, same vendor list, same "the porch boards near the steps are loose" observation — but tone calibration, DIY comfort, and how Captain talks to each person should be individual. The two-profile split in §6.3 / §6.4 already lines up with this.
+- **Chat history: shared or separate?** Both have merit. Shared lets one partner pick up where the other left off ("Sam asked the plumber about the wax ring yesterday — here's what they said"). Separate keeps personal threads private and avoids cross-talk. A reasonable default: one shared chat thread for the home, with individual messages still attributed to whoever sent them.
+- **Who can do what?** Most actions are collaborative by default. The interesting cases are destructive ones (deleting calendar entries, resetting profiles) and account-level ones (inviting another person, removing one). A simple owner / member split is probably enough for v1-of-this-feature.
+- **Notifications.** The Friday + Monday digests (§6.8) should fan out per person, calibrated to each personal profile's tone and timing preferences, but pulling from one shared home + calendar.
+- **The "biographer's instinct" stays singular.** Captain still speaks *about the home* in one voice. It just learns who's talking on each turn and adjusts how it speaks back.
+
+Worth designing the data model with this in mind sooner rather than later — even before the feature ships — because retrofitting multi-tenancy onto a single-user schema is the kind of thing that compounds in pain over time. The current single-home / single-conversation simplifications in v1 (see backend/store.py) should be expected to evolve.
+
+Related: the house passport (§11.1) is the *handoff* version of this same shape — many people over the home's lifetime, ownership changes hands. Multi-user is the *concurrent* version.
+
 ## 12. Open questions
 
 Things still genuinely unresolved and worth thinking about further.
