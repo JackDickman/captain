@@ -204,6 +204,12 @@ struct HomeView: View {
                 EmptyView()
             }
         }
+        // maxWidth before aspectRatio so the square fills the row's
+        // available width — without this, the leading-aligned content
+        // VStack would let the image collapse to its intrinsic size
+        // and float to the left, leaving uneven cream margin on the
+        // right of the brass frame.
+        .frame(maxWidth: .infinity)
         .aspectRatio(1, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         // Brass picture frame — echoes the framed sunflowers reference
