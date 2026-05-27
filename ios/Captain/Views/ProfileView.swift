@@ -125,7 +125,12 @@ struct ProfileView: View {
             case .owner:
                 MarkdownView(markdown: profile?.userMd ?? "")
             case .calendar:
-                CalendarList(entries: profile?.calendar ?? [])
+                CalendarList(
+                    entries: profile?.calendar ?? [],
+                    onDelete: { entry in
+                        Task { await deleteCalendarEntry(entry) }
+                    }
+                )
             }
         }
     }
@@ -139,6 +144,28 @@ struct ProfileView: View {
             loadError = "couldn't load profile: \(error.localizedDescription)"
         }
     }
+
+    /// Optimistic delete: drop the row from local state immediately so
+    /// the X feels responsive, then hit the API. On failure, refetch
+    /// to recover the row.
+    private func deleteCalendarEntry(_ entry: CalendarEntry) async {
+        if var profile = self.profile {
+            profile = ProfileResponse(
+                address: profile.address,
+                homeMd: profile.homeMd,
+                userMd: profile.userMd,
+                calendar: profile.calendar.filter { $0.id != entry.id }
+            )
+            self.profile = profile
+        }
+        do {
+            try await CaptainAPI.deleteCalendarEntry(entry.id)
+        } catch {
+            // Refetch to restore the row (and surface any other state
+            // that may have changed during the failure window).
+            await load()
+        }
+    }
 }
 
 // MARK: - CalendarList
@@ -148,6 +175,11 @@ struct ProfileView: View {
 /// items wear an arrow pair.
 struct CalendarList: View {
     let entries: [CalendarEntry]
+    /// Optional dismiss callback. When provided, each row shows a small
+    /// X on the right that removes the entry. Captain catches things
+    /// from chat sometimes that the user doesn't actually want pinned
+    /// to the calendar; this is the escape hatch.
+    var onDelete: ((CalendarEntry) -> Void)? = nil
 
     var body: some View {
         if entries.isEmpty {
@@ -219,6 +251,18 @@ struct CalendarList: View {
                 }
             }
             Spacer(minLength: 0)
+            if let onDelete {
+                Button {
+                    onDelete(entry)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(
+                            CaptainTheme.textMuted.opacity(0.5)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 12)

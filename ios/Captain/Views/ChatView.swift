@@ -84,10 +84,48 @@ struct ChatView: View {
             }
 
             Spacer()
+
+            // Overflow menu for chat-level actions. Quiet by default —
+            // the ellipsis is the only visible affordance.
+            Menu {
+                Button(role: .destructive) {
+                    showClearConfirm = true
+                } label: {
+                    Label("Clear chat history", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(CaptainTheme.textMuted)
+                    .frame(width: 32, height: 32)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(CaptainTheme.cream)
+        .confirmationDialog(
+            "Clear chat history?",
+            isPresented: $showClearConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Clear", role: .destructive) {
+                Task { await clearHistory() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This wipes the chat scroll-back for this home. Your home profile, owner profile, and calendar aren't affected.")
+        }
+    }
+
+    @State private var showClearConfirm = false
+
+    private func clearHistory() async {
+        do {
+            try await CaptainAPI.clearMessages()
+            messages = []
+        } catch {
+            loadError = "clear failed: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Messages
@@ -193,6 +231,14 @@ struct ChatView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 16))
                 .overlay(bubbleBorder(for: msg.role))
 
+                // Persisted "searched the web" badge — durable counterpart
+                // to the live in-flight indicator. Renders only on assistant
+                // turns where the model actually invoked web_search.
+                if !isUser,
+                   let queries = msg.searches, !queries.isEmpty {
+                    searchedBadge(queries: queries)
+                }
+
                 // Product cards attached to assistant messages (only
                 // when the model used find_products with num_options >= 2).
                 if !isUser,
@@ -203,6 +249,25 @@ struct ChatView: View {
             if !isUser { Spacer(minLength: 40) }
         }
         .padding(.horizontal, 16)
+    }
+
+    /// Compact "searched the web for X" footer rendered below an
+    /// assistant message that ran one or more web searches. Quieter
+    /// than the in-flight indicator — meant to read as a footnote, not
+    /// a banner. Multiple queries collapse onto a single line joined
+    /// with bullets.
+    private func searchedBadge(queries: [String]) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "globe")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(CaptainTheme.brass.opacity(0.7))
+            Text("searched the web · \(queries.joined(separator: " · "))")
+                .font(CaptainTheme.body(11))
+                .foregroundStyle(CaptainTheme.textMuted)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.leading, 6)
     }
 
     /// Vertical stack of product picks Captain attached to an assistant
@@ -641,6 +706,7 @@ struct ChatView: View {
             content: text,
             imageUrls: optimisticUrls.isEmpty ? nil : optimisticUrls,
             productPicks: nil,
+            searches: nil,
             createdAt: Date().timeIntervalSince1970
         )
         messages.append(optimistic)

@@ -473,6 +473,36 @@ enum CaptainAPI {
             .decode(WeatherResponse.self, from: data).periods
     }
 
+    /// DELETE /messages — wipe the chat scroll-back for the current home.
+    /// Profile + calendar + rendering are untouched.
+    static func clearMessages() async throws {
+        let url = baseURL.appendingPathComponent("messages")
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = 10
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.badStatus(code, "clear failed")
+        }
+    }
+
+    /// DELETE /calendar/{id} — remove a calendar entry the user dismisses
+    /// from the profile drawer.
+    static func deleteCalendarEntry(_ id: Int) async throws {
+        let url = baseURL.appendingPathComponent("calendar/\(id)")
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = 10
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw APIError.badStatus(code, "delete failed")
+        }
+    }
+
     /// GET /messages — full conversation history. Used to hydrate the chat
     /// view on launch / when ChatView first appears.
     static func fetchMessages() async throws -> [ChatMessage] {

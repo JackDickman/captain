@@ -936,6 +936,41 @@ def get_messages() -> dict:
     return {"messages": store.get_all_messages(conv_id)}
 
 
+@app.delete("/messages")
+def clear_messages() -> dict:
+    """Wipe the chat history for the current home. Profile + calendar +
+    rendering are untouched — just the chat scroll-back resets. Used by
+    the profile drawer's "clear chat history" affordance (also handy
+    after toggling fixture mode off, since fixture chats persist)."""
+    home = store.get_home()
+    if not home:
+        return {"deleted": 0}
+    conv_id = store.get_or_create_conversation(home["id"])
+    n = store.clear_messages(conv_id)
+    print(f"[messages] cleared {n} message(s) for home {home['id']}")
+    return {"deleted": n}
+
+
+@app.delete("/calendar/{entry_id}")
+def delete_calendar_entry(entry_id: int) -> dict:
+    """Remove one calendar entry. Used when the user dismisses an
+    auto-captured item from the profile drawer."""
+    home = store.get_home()
+    if not home:
+        raise HTTPException(404, "no home yet")
+    ok = store.delete_calendar_entry(home["id"], entry_id)
+    if not ok:
+        raise HTTPException(404, f"calendar entry {entry_id} not found")
+    # Calendar changed → invalidate the radar cache so the next /radar
+    # call regenerates against the updated set.
+    try:
+        from . import radar
+        radar.invalidate_cache()
+    except Exception as e:  # noqa: BLE001
+        print(f"[calendar] radar cache invalidation failed: {e}")
+    return {"deleted": entry_id}
+
+
 @app.get("/debug/state")
 def debug_state() -> dict:
     """Inspect what the backend has learned so far. Dev convenience."""

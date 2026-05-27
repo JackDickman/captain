@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS messages (
     image_url TEXT,               -- legacy single-photo field (kept for old rows)
     image_urls TEXT,              -- JSON array of relative URLs for attached photos
     product_picks TEXT,           -- JSON array of product cards (assistant-side only)
+    searches TEXT,                -- JSON array of web-search queries this assistant turn ran
     created_at REAL NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
 );
@@ -109,6 +110,7 @@ def init_db() -> None:
             "ALTER TABLE messages ADD COLUMN image_url TEXT",
             "ALTER TABLE messages ADD COLUMN image_urls TEXT",
             "ALTER TABLE messages ADD COLUMN product_picks TEXT",
+            "ALTER TABLE messages ADD COLUMN searches TEXT",
         ]:
             try:
                 c.execute(ddl)
@@ -327,6 +329,17 @@ def _hydrate_message_row(r: sqlite3.Row) -> dict:
         except json.JSONDecodeError:
             pass
     d["product_picks"] = picks
+
+    searches_json = d.pop("searches", None)
+    searches: list[str] = []
+    if searches_json:
+        try:
+            decoded = json.loads(searches_json)
+            if isinstance(decoded, list):
+                searches = [str(s) for s in decoded if s]
+        except json.JSONDecodeError:
+            pass
+    d["searches"] = searches
     return d
 
 
@@ -334,17 +347,19 @@ def add_message(
     conversation_id: int, role: str, content: str,
     image_urls: list[str] | None = None,
     product_picks: list[dict] | None = None,
+    searches: list[str] | None = None,
 ) -> int:
     urls_json = json.dumps(image_urls) if image_urls else None
     picks_json = json.dumps(product_picks) if product_picks else None
+    searches_json = json.dumps(searches) if searches else None
     with connect() as c:
         cur = c.execute(
             """INSERT INTO messages
                  (conversation_id, role, content,
-                  image_urls, product_picks, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+                  image_urls, product_picks, searches, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (conversation_id, role, content,
-             urls_json, picks_json, time.time()),
+             urls_json, picks_json, searches_json, time.time()),
         )
         return cur.lastrowid
 
@@ -354,7 +369,7 @@ def get_recent_messages(conversation_id: int, limit: int = 20) -> list[dict]:
     with connect() as c:
         rows = c.execute(
             """SELECT id, role, content, image_url, image_urls,
-                      product_picks, created_at
+                      product_picks, searches, created_at
                FROM messages WHERE conversation_id = ?
                ORDER BY id DESC LIMIT ?""",
             (conversation_id, limit),
@@ -367,9 +382,35 @@ def get_all_messages(conversation_id: int) -> list[dict]:
     with connect() as c:
         rows = c.execute(
             """SELECT id, role, content, image_url, image_urls,
-                      product_picks, created_at
+                      product_picks, searches, created_at
                FROM messages WHERE conversation_id = ?
                ORDER BY id""",
             (conversation_id,),
         ).fetchall()
         return [_hydrate_message_row(r) for r in rows]
+
+
+def clear_messages(conversation_id: int) -> int:
+    """Delete every message in a conversation. Returns the number deleted.
+    Used by the profile drawer's "clear chat history" affordance — fresh
+    start for the same home (profile + calendar + rendering are NOT
+    affected; just the chat scroll-back)."""
+    with connect() as c:
+        cur = c.execute(
+            "DELETE FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        return cur.rowcount
+
+
+def delete_calendar_entry(home_id: int, entry_id: int) -> bool:
+    """Remove one calendar entry by id. Used when the user dismisses an
+    auto-captured item from the profile drawer's calendar tab. Returns
+    True if a row was deleted (False if it didn't exist or belonged to
+    another home)."""
+    with connect() as c:
+        cur = c.execute(
+            "DELETE FROM calendar_entries WHERE id = ? AND home_id = ?",
+            (entry_id, home_id),
+        )
+        return cur.rowcount > 0

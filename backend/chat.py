@@ -755,6 +755,7 @@ def respond_to_message(
     store.add_message(
         conv_id, "assistant", assistant_text,
         product_picks=product_picks if product_picks else None,
+        searches=searches if searches else None,
     )
 
     return {

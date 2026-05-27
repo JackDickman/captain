@@ -30,6 +30,10 @@ struct ChatMessage: Codable, Equatable, Identifiable, Hashable {
     /// find_products tool. Empty / nil on user messages and on assistant
     /// messages where the model chose num_options=1 (embedded inline).
     let productPicks: [ProductPick]?
+    /// Web-search queries Captain ran during this assistant turn (in
+    /// order). Persisted so the "searched the web for X" badge re-renders
+    /// after a chat reload, not just immediately after the send.
+    let searches: [String]?
     let createdAt: Double
 
     enum Role: String, Codable {
@@ -41,6 +45,7 @@ struct ChatMessage: Codable, Equatable, Identifiable, Hashable {
         case id, role, content
         case imageUrls = "image_urls"
         case productPicks = "product_picks"
+        case searches
         case createdAt = "created_at"
     }
 }
