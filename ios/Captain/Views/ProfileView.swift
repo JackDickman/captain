@@ -51,15 +51,12 @@ struct ProfileView: View {
                         .background(Circle().fill(CaptainTheme.creamDeep))
                 }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("what Captain knows")
-                        .font(CaptainTheme.body(13))
-                        .foregroundStyle(CaptainTheme.textMuted)
-                    Text(profile?.address ?? session.address)
-                        .font(CaptainTheme.display(15))
-                        .foregroundStyle(CaptainTheme.textPrimary)
-                        .lineLimit(1)
-                }
+                // The address lives only on the home screen (per design).
+                // Here, just the title for the drawer — the rest of the
+                // surface tells you whose home it is.
+                Text("what Captain knows")
+                    .font(CaptainTheme.display(17))
+                    .foregroundStyle(CaptainTheme.textPrimary)
 
                 Spacer()
             }

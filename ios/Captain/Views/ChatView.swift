@@ -73,15 +73,12 @@ struct ChatView: View {
                     .strokeBorder(CaptainTheme.brass, lineWidth: 1.5)
             )
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Captain")
-                    .font(CaptainTheme.display(15))
-                    .foregroundStyle(CaptainTheme.textPrimary)
-                Text(session.address)
-                    .font(CaptainTheme.body(11))
-                    .foregroundStyle(CaptainTheme.textMuted)
-                    .lineLimit(1)
-            }
+            // Address is intentionally absent here — it lives only on
+            // the home screen. The Captain title + the home thumbnail
+            // next to it carry the "this home" context.
+            Text("Captain")
+                .font(CaptainTheme.display(17))
+                .foregroundStyle(CaptainTheme.textPrimary)
 
             Spacer()
 
