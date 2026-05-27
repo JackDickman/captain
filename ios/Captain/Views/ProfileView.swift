@@ -39,32 +39,52 @@ struct ProfileView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 12) {
-            Button {
-                dismiss()
-            } label: {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(CaptainTheme.textMuted)
-                    .frame(width: 32, height: 32)
-                    .background(Circle().fill(CaptainTheme.creamDeep))
-            }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(CaptainTheme.textMuted)
+                        .frame(width: 32, height: 32)
+                        .background(Circle().fill(CaptainTheme.creamDeep))
+                }
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text("what Captain knows")
-                    .font(CaptainTheme.body(13))
-                    .foregroundStyle(CaptainTheme.textMuted)
-                Text(profile?.address ?? session.address)
-                    .font(CaptainTheme.display(15))
-                    .foregroundStyle(CaptainTheme.textPrimary)
-                    .lineLimit(1)
-            }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("what Captain knows")
+                        .font(CaptainTheme.body(13))
+                        .foregroundStyle(CaptainTheme.textMuted)
+                    Text(profile?.address ?? session.address)
+                        .font(CaptainTheme.display(15))
+                        .foregroundStyle(CaptainTheme.textPrimary)
+                        .lineLimit(1)
+                }
 
-            Spacer()
+                Spacer()
+            }
+            // Honest "these are your home's colors" reveal — the
+            // palette Captain extracted from the first-session photo,
+            // rendered as a thin capsule. PRD §7.3 expects the palette
+            // to feel present in the app; this is its quiet placement.
+            if !session.palette.isEmpty {
+                PaletteStrip(colors: session.palette)
+                    .frame(height: 4)
+                    .padding(.leading, 44)  // align with the title column
+                    .padding(.trailing, 4)
+            }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.top, 12)
+        .padding(.bottom, 10)
         .background(CaptainTheme.cream)
+    }
+
+    /// Active-tab accent — pulled from the home's palette so the
+    /// "this is your home" feel carries into the drawer. Falls back to
+    /// brass when the palette doesn't yield a usable color.
+    private var tabAccent: Color {
+        HomeAccent.pick(from: session.palette) ?? CaptainTheme.brass
     }
 
     // MARK: - Tab bar
@@ -96,8 +116,8 @@ struct ProfileView: View {
                     )
                 Rectangle()
                     .fill(selected
-                          ? CaptainTheme.brass
-                          : CaptainTheme.brass.opacity(0.0))
+                          ? tabAccent
+                          : Color.clear)
                     .frame(height: 2)
             }
             .frame(maxWidth: .infinity)
