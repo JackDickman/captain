@@ -14,16 +14,6 @@ struct HomeView: View {
     @State private var radar: RadarResponse?
     @State private var radarLoading = true
 
-    /// One tasteful accent color pulled from the home's extracted
-    /// palette — drives the warm top-of-screen gradient so the home
-    /// screen is visibly "this user's home" without the UI risking a
-    /// fight with the rendered portrait below. Falls back to brass
-    /// when the palette has nothing usable (near-black, near-white,
-    /// gray); the gradient just reads as warm rather than colored in
-    /// that case. See HomeAccent for the picking logic.
-    private var homeAccent: Color {
-        HomeAccent.pick(from: session.palette) ?? CaptainTheme.brass
-    }
 
     var body: some View {
         ZStack {
@@ -77,21 +67,8 @@ struct HomeView: View {
     // MARK: - Background
 
     private var background: some View {
-        ZStack {
-            CaptainTheme.cream
-            // Soft kiss of palette color at the very top of the screen,
-            // fading to clear well before the rendered home starts. Two
-            // calibrations matter here: low opacity (so a vivid red
-            // door doesn't wash the air pink), and a tight gradient
-            // (so it never bleeds into the picture frame area). The
-            // rendered home stays the visual anchor.
-            LinearGradient(
-                colors: [homeAccent.opacity(0.12), .clear],
-                startPoint: .top,
-                endPoint: UnitPoint(x: 0.5, y: 0.18)
-            )
-        }
-        .ignoresSafeArea()
+        CaptainTheme.cream
+            .ignoresSafeArea()
     }
 
     // MARK: - Content

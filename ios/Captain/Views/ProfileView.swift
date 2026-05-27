@@ -39,49 +39,29 @@ struct ProfileView: View {
     // MARK: - Header
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(CaptainTheme.textMuted)
-                        .frame(width: 32, height: 32)
-                        .background(Circle().fill(CaptainTheme.creamDeep))
-                }
-
-                // The address lives only on the home screen (per design).
-                // Here, just the title for the drawer — the rest of the
-                // surface tells you whose home it is.
-                Text("what Captain knows")
-                    .font(CaptainTheme.display(17))
-                    .foregroundStyle(CaptainTheme.textPrimary)
-
-                Spacer()
+        HStack(spacing: 12) {
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(CaptainTheme.textMuted)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(CaptainTheme.creamDeep))
             }
-            // Honest "these are your home's colors" reveal — the
-            // palette Captain extracted from the first-session photo,
-            // rendered as a thin capsule. PRD §7.3 expects the palette
-            // to feel present in the app; this is its quiet placement.
-            if !session.palette.isEmpty {
-                PaletteStrip(colors: session.palette)
-                    .frame(height: 4)
-                    .padding(.leading, 44)  // align with the title column
-                    .padding(.trailing, 4)
-            }
+
+            // The address lives only on the home screen (per design).
+            // Here, just the title for the drawer — the rest of the
+            // surface tells you whose home it is.
+            Text("what Captain knows")
+                .font(CaptainTheme.display(17))
+                .foregroundStyle(CaptainTheme.textPrimary)
+
+            Spacer()
         }
         .padding(.horizontal, 16)
-        .padding(.top, 12)
-        .padding(.bottom, 10)
+        .padding(.vertical, 12)
         .background(CaptainTheme.cream)
-    }
-
-    /// Active-tab accent — pulled from the home's palette so the
-    /// "this is your home" feel carries into the drawer. Falls back to
-    /// brass when the palette doesn't yield a usable color.
-    private var tabAccent: Color {
-        HomeAccent.pick(from: session.palette) ?? CaptainTheme.brass
     }
 
     // MARK: - Tab bar
@@ -113,7 +93,7 @@ struct ProfileView: View {
                     )
                 Rectangle()
                     .fill(selected
-                          ? tabAccent
+                          ? CaptainTheme.brass
                           : Color.clear)
                     .frame(height: 2)
             }
