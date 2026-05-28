@@ -773,6 +773,69 @@ def respond_to_message(
     }
 
 
+def explain_radar_item(
+    home_id: int, item_type: str, item_text: str,
+    *, now: datetime | None = None,
+) -> str:
+    """One-shot kickoff message Captain sends when the user taps a radar
+    item to learn more. Uses the full chat system prompt (home, owner,
+    calendar, weather, current date) plus recent chat history so the
+    explanation can refer to prior discussions of the same item, then
+    asks the model for a tight 3-4 sentence what/why/when/how.
+
+    Persists ONLY the assistant message — the user didn't type
+    anything, so we don't fabricate a user turn in scroll-back. The
+    next time the user asks a follow-up, the chat LLM sees this
+    assistant message in history and stays grounded on the topic.
+    """
+    from .weather import get_forecast_summary
+
+    home = store.get_home() or {}
+    calendar = store.get_calendar(home_id)
+    lat = home.get("lat") or DEFAULT_LAT
+    lng = home.get("lng") or DEFAULT_LNG
+    weather = get_forecast_summary(lat, lng)
+
+    conv_id = store.get_or_create_conversation(home_id)
+    history = store.get_recent_messages(conv_id, limit=20)
+
+    system_prompt = _build_system_prompt(
+        home, calendar, weather, now=now,
+    )
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    for m in history:
+        messages.append({"role": m["role"], "content": m["content"]})
+
+    # The kickoff instruction is sent as a transient "user" turn — it
+    # tells the model what to do but is not persisted. The model's
+    # reply IS persisted as the new assistant message.
+    kickoff = (
+        f"[radar-kickoff] The user just tapped this {item_type} item "
+        f"from their radar to learn more. Briefly explain it in 3-4 "
+        f"sentences — what it is, why it's worth their attention (the "
+        f"reasoning), when it matters, and a concrete next step or "
+        f"two. Be specific to THIS home and THIS owner — reference "
+        f"what you know about them. Don't start with 'great question' "
+        f"or any throat-clearing — open with the explanation itself. "
+        f"End with one open invitation like 'want me to talk through "
+        f"the options?' or 'anything specific you want to dig into?' "
+        f"so the user knows they can follow up.\n\n"
+        f"THE ITEM:\n{item_text}"
+    )
+    messages.append({"role": "user", "content": kickoff})
+
+    client = OpenAI()
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+        temperature=0.7,
+    )
+    assistant_text = resp.choices[0].message.content or ""
+
+    store.add_message(conv_id, "assistant", assistant_text)
+    return assistant_text
+
+
 def extract_calendar_updates(home_id: int, user_message: str,
                              assistant_message: str,
                              *, now: datetime | None = None) -> dict:

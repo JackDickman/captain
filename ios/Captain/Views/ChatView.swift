@@ -4,14 +4,28 @@ import SwiftUI
 /// The expanding chat surface (PRD §7.6). Presented from HomeView's chat bar.
 /// Input accepts text + zero-or-more attached photos. Bubbles render any
 /// attached images as a horizontal strip above the text.
+/// Identifies a radar item the chat was opened from — used as a
+/// kickoff signal so Captain auto-sends a what/why/when/how primer as
+/// the first assistant message.
+struct RadarKickoff: Equatable, Hashable {
+    /// "calendar" for future / recurring entries, "suggestion" for the
+    /// LLM-generated radar suggestions.
+    let itemType: String
+    /// Free-form prose Captain's chat model receives as the topic.
+    /// For calendar items, this is just the entry's text. For
+    /// suggestions, we include title + reason + timeframe so the
+    /// model can riff on the original justification.
+    let itemText: String
+}
+
 struct ChatView: View {
     let session: FirstSessionResponse
-    /// Text the chat input opens pre-filled with. Lets callers (e.g.
-    /// a radar item tap) hand the user a contextual starter they can
-    /// append to or replace. PRD §7.6 anticipates this: "When chat is
-    /// opened from a specific context (a calendar entry, a profile
-    /// field, a radar item), the input is context-aware…"
-    var initialDraft: String? = nil
+    /// When set, Captain sends an automatic primer message as soon as
+    /// the chat opens — what the radar item is, why it matters, and
+    /// how to act on it. The user's input stays empty so they can
+    /// follow up naturally. PRD §7.6: "When chat is opened from a
+    /// specific context… the input is context-aware."
+    var radarKickoff: RadarKickoff? = nil
 
     @Environment(\.dismiss) private var dismiss
 
@@ -47,19 +61,35 @@ struct ChatView: View {
             }
         }
         .task { await loadMessages() }
-        .onAppear {
-            // If a caller passed in a pre-filled draft (e.g. tap from
-            // a radar item), seed the input and focus it so the user
-            // can keep typing right after the contextual starter.
-            // Done in onAppear (not init) because SwiftUI may reuse a
-            // ChatView instance across fullScreenCover presentations
-            // and not call init — onAppear is the reliable hook.
-            if let starter = initialDraft, !starter.isEmpty {
-                draft = starter
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    inputFocused = true
-                }
+        .task {
+            // If we opened from a radar item, kick off the auto-primer
+            // as soon as the view appears. The kickoff handler shows
+            // the thinking bubble immediately, runs the API call, then
+            // refreshes history so Captain's first message lands.
+            if let kickoff = radarKickoff {
+                await runRadarKickoff(kickoff)
             }
+        }
+    }
+
+    /// Fires the radar-kickoff API call and folds Captain's primer
+    /// into the chat history. Behaves like a normal "send" turn from
+    /// the user's perspective — thinking dots while Captain composes,
+    /// then the message appears at the bottom — except no user bubble
+    /// is shown because the user didn't type anything.
+    private func runRadarKickoff(_ kickoff: RadarKickoff) async {
+        isSending = true
+        sendStage = .thinking
+        defer { isSending = false }
+        do {
+            _ = try await CaptainAPI.explainRadarItem(
+                itemType: kickoff.itemType,
+                itemText: kickoff.itemText,
+            )
+            let fresh = try await CaptainAPI.fetchMessages()
+            messages = fresh
+        } catch {
+            loadError = "Couldn't load context: \(error.localizedDescription)"
         }
     }
 

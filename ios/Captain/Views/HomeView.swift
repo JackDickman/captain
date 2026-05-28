@@ -22,15 +22,15 @@ struct HomeView: View {
     @State private var hunt: HuntResponse?
     /// Set by RadarView's tap callback right before it dismisses; the
     /// sheet's onDismiss reads this to decide whether to open chat.
-    @State private var pendingChatDraft: String?
+    @State private var pendingRadarKickoff: RadarKickoff?
 
     /// Identifiable wrapper so `.fullScreenCover(item:)` treats every
     /// new chat presentation as a unique view identity. The UUID is
     /// the key — without it, SwiftUI happily reuses the previous
-    /// ChatView instance and the pre-filled draft never lands.
+    /// ChatView instance and the kickoff never lands.
     fileprivate struct ChatPresentation: Identifiable {
         let id = UUID()
-        let initialDraft: String?
+        let radarKickoff: RadarKickoff?
     }
 
 
@@ -42,7 +42,7 @@ struct HomeView: View {
         .fullScreenCover(item: $chatPresentation) { presentation in
             ChatView(
                 session: session,
-                initialDraft: presentation.initialDraft,
+                radarKickoff: presentation.radarKickoff,
             )
         }
         .sheet(isPresented: $profilePresented) {
@@ -50,22 +50,22 @@ struct HomeView: View {
         }
         .sheet(isPresented: $radarPresented, onDismiss: {
             // If the user tapped a radar item, the closure stored a
-            // draft. Now that the radar sheet is gone, open chat with
-            // that draft — async dispatch so the sheet-dismiss
+            // kickoff. Now that the radar sheet is gone, open chat
+            // with that kickoff — async dispatch so the sheet-dismiss
             // animation finishes before the cover-present animation
             // starts (sheet→cover transitions are otherwise twitchy).
-            if let draft = pendingChatDraft {
-                pendingChatDraft = nil
+            if let kickoff = pendingRadarKickoff {
+                pendingRadarKickoff = nil
                 DispatchQueue.main.async {
                     chatPresentation = ChatPresentation(
-                        initialDraft: draft,
+                        radarKickoff: kickoff,
                     )
                 }
             }
         }) {
             if let radar {
-                RadarView(radar: radar) { draft in
-                    pendingChatDraft = draft
+                RadarView(radar: radar) { kickoff in
+                    pendingRadarKickoff = kickoff
                 }
             }
         }
@@ -83,7 +83,7 @@ struct HomeView: View {
             // corresponding sheet immediately (used for screenshots).
             if args.contains("--auto-chat") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    chatPresentation = ChatPresentation(initialDraft: nil)
+                    chatPresentation = ChatPresentation(radarKickoff: nil)
                 }
             }
             if args.contains("--show-profile") {
@@ -347,7 +347,7 @@ struct HomeView: View {
     /// background runs unbroken through the home screen.
     private var chatCapsule: some View {
         Button {
-            chatPresentation = ChatPresentation(initialDraft: nil)
+            chatPresentation = ChatPresentation(radarKickoff: nil)
         } label: {
             HStack(spacing: 12) {
                 Text("ask about your home…")

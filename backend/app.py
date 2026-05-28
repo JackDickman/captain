@@ -931,6 +931,38 @@ def chat_status(chat_id: str) -> dict:
     }
 
 
+@app.post("/chat/radar-explain")
+async def explain_radar_item(
+    item_type: Annotated[str, Form()],
+    item_text: Annotated[str, Form()],
+    x_captain_local_time: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """Captain sends the first message in a chat the user just opened
+    from a radar item — a tight 3-4 sentence what/why/when/how primer.
+    iOS calls this when ChatView's onAppear sees a RadarKickoff. The
+    assistant message is persisted directly (no fake user turn) and
+    returned for optimistic display."""
+    home = store.get_home()
+    if not home:
+        raise HTTPException(400, "no home yet")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(500, "OPENAI_API_KEY missing on backend")
+
+    user_now = _parse_local_time(x_captain_local_time)
+    try:
+        text = chat_mod.explain_radar_item(
+            home["id"], item_type, item_text, now=user_now,
+        )
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        raise HTTPException(500, f"radar explain failed: {e}") from e
+
+    conv_id = store.get_or_create_conversation(home["id"])
+    latest = store.get_recent_messages(conv_id, limit=1)
+    msg_id = latest[0]["id"] if latest else -1
+    return {"message_id": msg_id, "response": text}
+
+
 @app.get("/weather")
 def weather() -> dict:
     """Structured forecast for the home's location. Used by the iOS home

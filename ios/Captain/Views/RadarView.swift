@@ -7,11 +7,13 @@ import SwiftUI
 struct RadarView: View {
     let radar: RadarResponse
     /// Called when the user taps a calendar item or suggestion card.
-    /// The closure receives a contextual draft string the parent uses
-    /// to open the chat surface pre-filled. RadarView dismisses itself
-    /// immediately on tap; the parent's sheet onDismiss hook is the
-    /// natural place to then present the chat.
-    var onTapItem: ((String) -> Void)? = nil
+    /// The closure receives a RadarKickoff that identifies the topic
+    /// the chat should auto-open with — Captain sends the first
+    /// message as a primer rather than pre-filling the user's input.
+    /// RadarView dismisses itself immediately on tap; the parent's
+    /// sheet onDismiss hook is the natural place to then present the
+    /// chat with the kickoff.
+    var onTapItem: ((RadarKickoff) -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
 
@@ -35,7 +37,7 @@ struct RadarView: View {
                             VStack(spacing: 10) {
                                 ForEach(radar.calendarItems) { entry in
                                     Button {
-                                        handleTap(draft: chatDraft(forCalendar: entry))
+                                        handleTap(kickoff: kickoff(forCalendar: entry))
                                     } label: {
                                         calendarRow(entry)
                                     }
@@ -48,7 +50,7 @@ struct RadarView: View {
                             VStack(spacing: 10) {
                                 ForEach(radar.suggestions) { s in
                                     Button {
-                                        handleTap(draft: chatDraft(forSuggestion: s))
+                                        handleTap(kickoff: kickoff(forSuggestion: s))
                                     } label: {
                                         suggestionCard(s)
                                     }
@@ -99,27 +101,37 @@ struct RadarView: View {
 
     // MARK: - Tap handling
 
-    /// Forwards the contextual chat draft to the parent and dismisses
-    /// the radar sheet. The parent (HomeView) listens on the sheet's
-    /// onDismiss hook to then open the chat full-screen cover with the
-    /// stored draft.
-    private func handleTap(draft: String) {
-        onTapItem?(draft)
+    /// Forwards the kickoff context to the parent and dismisses the
+    /// radar sheet. The parent (HomeView) listens on the sheet's
+    /// onDismiss hook to then open the chat full-screen cover and
+    /// trigger Captain's primer message.
+    private func handleTap(kickoff: RadarKickoff) {
+        onTapItem?(kickoff)
         dismiss()
     }
 
-    /// Contextual chat starter for a calendar entry — natural prose
-    /// the user can extend or replace. Uses the entry's text verbatim
-    /// inside quotes so Captain knows what's being referenced.
-    private func chatDraft(forCalendar entry: CalendarEntry) -> String {
-        "About \"\(entry.text)\" — "
+    /// Kickoff payload for a calendar entry. Just the entry's text —
+    /// the chat LLM already has the full calendar in its system prompt.
+    private func kickoff(forCalendar entry: CalendarEntry) -> RadarKickoff {
+        RadarKickoff(
+            itemType: "calendar",
+            itemText: entry.text,
+        )
     }
 
-    /// Same for an AI suggestion. References the title (not the
-    /// reason) so the draft stays short and the user can add their
-    /// own framing.
-    private func chatDraft(forSuggestion s: RadarSuggestion) -> String {
-        "About the idea to \(s.title.lowercased()) — "
+    /// Kickoff payload for an AI suggestion. Title + reason +
+    /// timeframe so the model can riff on the original justification
+    /// rather than recompute it from scratch.
+    private func kickoff(forSuggestion s: RadarSuggestion) -> RadarKickoff {
+        let parts: [String] = [
+            "Title: \(s.title)",
+            "Reason: \(s.reason)",
+            s.timeframe.isEmpty ? nil : "Timeframe: \(s.timeframe)",
+        ].compactMap { $0 }
+        return RadarKickoff(
+            itemType: "suggestion",
+            itemText: parts.joined(separator: "\n"),
+        )
     }
 
     private var totalLabel: String {

@@ -468,6 +468,58 @@ enum CaptainAPI {
         }
     }
 
+    /// POST /chat/radar-explain — kickoff message Captain sends when
+    /// the user taps a radar item to learn more. Persists ONLY the
+    /// assistant turn (no fabricated user message in scroll-back).
+    /// Returns the persisted message id + text so the caller can show
+    /// optimistically before re-fetching full history.
+    static func explainRadarItem(
+        itemType: String, itemText: String,
+    ) async throws -> ChatResponse {
+        let url = baseURL.appendingPathComponent("chat/radar-explain")
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var request = makeRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        // The chat LLM runs synchronously here; usual chat response
+        // takes a few seconds, multi-image-aware Vision models can
+        // take longer. Generous timeout.
+        request.timeoutInterval = 120
+
+        var body = Data()
+        func appendString(_ s: String) {
+            body.append(s.data(using: .utf8)!)
+        }
+        appendString("--\(boundary)\r\n")
+        appendString(
+            "Content-Disposition: form-data; name=\"item_type\"\r\n\r\n"
+        )
+        appendString("\(itemType)\r\n")
+        appendString("--\(boundary)\r\n")
+        appendString(
+            "Content-Disposition: form-data; name=\"item_text\"\r\n\r\n"
+        )
+        appendString("\(itemText)\r\n")
+        appendString("--\(boundary)--\r\n")
+        request.httpBody = body
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let body = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw APIError.badStatus(code, body)
+        }
+        do {
+            return try JSONDecoder().decode(ChatResponse.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
     // MARK: - Scavenger hunt
 
     /// GET /hunt — full hunt state (applicable items + progress).
