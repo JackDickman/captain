@@ -1,7 +1,7 @@
 # Captain — Product Requirements Document (v1)
 
-**Version:** 1.1
-**Last updated:** May 26, 2026
+**Version:** 1.2
+**Last updated:** May 27, 2026
 **Status:** Draft — personal pet project, under active build
 
 ---
@@ -103,21 +103,33 @@ The same photo also drives **UI customization**: the app's color palette, accent
 
 **Speculative pre-render.** The current-season home rendering — the slowest stage by far — is kicked off the moment the user picks their photo in the form, in parallel with them typing the address. By the time they tap submit, the render is usually mostly or fully done, and the loading screen often only covers the remaining ~15s of search + extraction + finalization instead of the full ~45s.
 
-### 6.2 Optional "I just moved in" mode
+### 6.2 The scavenger hunt — "I just moved in" mode
 
-After the first-session photo flow, new owners can opt into a guided setup workflow — a scavenger hunt through the house, structured as a checklist of items to find and photograph. Captain prompts the user to find and photograph things like:
+After the first-session photo flow, new owners can opt into a guided tour of the home — a curated checklist of safety essentials, mechanicals, "worth knowing" first-timer wins, and about-you items. v1 ships with **18 items across 5 categories**:
 
-- Water and gas shutoffs
-- Breaker box (and label what controls what)
-- HVAC unit and filter slot
-- Water heater
-- Smoke and CO detectors
-- Outdoor spigots and sprinkler controls
-- Any appliance labels worth capturing
+- **About your home** (5 branch questions): home_basics confirmation, heat source, water source, sewer/septic, basement/crawl space
+- **Safety essentials** (5): main water shutoff, gas shutoff (only when gas heat), electrical panel, smoke + CO detectors, sump pump (only when basement)
+- **Mechanicals** (3): HVAC unit + filter, water heater, thermostat
+- **Worth knowing** (3 first-timer wins): sewer cleanout, dryer vent path, GFCI outlets
+- **About you** (2): who lives here, how Captain should talk to you
 
-The workflow is fully self-paced: the user can start it, leave at any time, and resume whenever they want. It's not metered or scheduled by Captain. It stays available as an open thread the user can pick back up on their own terms, or dismiss entirely if they're not interested. Each photo feeds the home profile via the same image-extraction pipeline used elsewhere. The byproduct is a complete, useful home profile — built in whatever rhythm suits the user.
+Items are a mix of photo-required ("show me your breaker box") and text-only ("what heats your home?"). The catalog is trimmed by design for v1 — easier to validate the flow before expanding.
 
-This is optional so users who already feel oriented in their home aren't pushed into it.
+**Adaptive: branch questions gate dependents.** The five "About your home" items appear at the top of the list. As the user answers them, dependent items appear: answering `heat_source` with "natural gas" reveals `gas_shutoff`; answering `has_basement` with "full" reveals `sump_pump`; items that don't apply (e.g., oil-tank questions on a gas-heated home) never surface.
+
+**Adaptive: already-known suppression.** Each catalog item declares a small list of profile keywords. When Captain loads the tour, it scans `home.md` and `user.md` for matches and surfaces a quiet "already known" pill on those items, with the matched snippet shown as a "Captain seems to know this already — confirm or update?" card inside the item. Users who've already discussed their HVAC in chat aren't asked from scratch.
+
+**Document upload at the start.** Before walking the tour, the user can photograph their inspection report, seller's disclosure, closing docs, or appliance manuals. A vision LLM extracts what it can — heat source, water heater specs, electrical panel notes, GFCI locations, etc. — and pre-fills the relevant items as "from your docs" with a confirmation step. Items pre-filled this way still require the user to tap save before they commit to the profile; Captain never auto-writes from raw doc extractions without user agency. Personal items (household composition, talking style) deliberately opt out of doc extraction.
+
+**Fully self-paced.** Start, leave at any time, resume. Every action writes immediately to the `hunt_progress` table — closing the app mid-item leaves it pending; the next open picks up where the user left off. The home-screen banner stays visible until every applicable item is resolved (done, skipped, or marked not applicable), then disappears. The user can mark any item not-applicable themselves if Captain's branch detection guesses wrong.
+
+**Same memory pipeline as chat.** Each completed item synthesizes an exchange tagged `[scavenger hunt: <title>]` and runs it through the regular `update_memory_from_exchange`, which:
+
+- rewrites `home.md` (for home facts) and `user.md` (for owner facts) — the rewriter routes by category, so the "Heat source" answer lands in the home profile's Systems section, while "Who lives here" lands in the owner profile's Preferences;
+- extracts any dated/recurring entries into the calendar (e.g., "Planning to upgrade the furnace in fall 2026" → a `future` calendar entry with `occurred_at: 2026-09-01`);
+- invalidates the radar cache so the next /radar regenerates against the richer context.
+
+Photos attached to an item are passed to the profile rewriter as vision context, so visible-only facts (an appliance's brand from the data plate, a panel's amperage, a thermostat model) make it into the profile without the user having to transcribe.
 
 ### 6.3 The home profile
 
@@ -246,6 +258,8 @@ What's on the radar right now is important but should not be the first thing the
 **The home-screen surface:** a compact card between the weather widget and the chat input. The card surfaces a tone-calibrated lead line ("a couple things to consider this week" / "nothing pressing on your radar"), a breakdown of the two streams ("3 coming up · 4 to consider"), and a small cluster of category icons hinting at what's inside. Beneath those, a single peek row shows the most relevant item — the soonest calendar entry in the next two weeks, or the top suggestion otherwise.
 
 **Tapping the card opens the full radar view** as a sheet — two sections ("Coming up" / "Things to consider") with each item's reason and timeframe. This replaces the originally-proposed pull-up bottom-sheet gesture (which collapsed radar + calendar + biography into one sweep); the simpler card + sheet pattern lands the same intent with clearer affordances and less gesture learning. The full home biography lives in the profile drawer instead (see §7.7).
+
+**Tap any item to start a chat about it.** Each calendar entry and each suggestion in the radar sheet is itself a tappable button. Tap one and the radar dismisses, the chat surface opens, and Captain auto-sends the first message — a tight 3-4 sentence what/why/when/how primer specific to this home and owner, ending with an open invitation to follow up ("want me to talk through the options?"). The user types their actual question from there. The primer is persisted as a regular assistant message (no fabricated user turn in scroll-back), so chat history reads naturally on subsequent visits and the LLM stays grounded if the user asks follow-ups. PRD §7.6's "input is context-aware" promise is realized through this flow — the context arrives as Captain's opening message rather than a pre-filled draft in the user's input, which is what people actually want when they tap an item to "learn more."
 
 ### 7.6 The chat surface
 
