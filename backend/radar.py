@@ -21,9 +21,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openai import OpenAI
-
-from . import profiles, store
+from . import llm, profiles, store
 from .weather import get_forecast_summary
 
 CACHE_DIR = Path(__file__).parent / "cache"
@@ -175,15 +173,14 @@ Hard rules:
  - DO NOT duplicate items already on the calendar — those are shown separately in the radar. Add things that aren't already tracked.
  - NEVER mention sale prices, market values, tax assessments, or any other financial valuation. This app deliberately avoids financial surfaces.
  - Skip "monitor for issues" filler. Every suggestion must be a concrete action.
- - Calibrate tone to the owner's DIY comfort level (if shown in the profile). Skip basic instructions for handy owners; orient briefly for new ones.
+ - Calibrate tone to the owner's profile. The owner profile may have a "Communication" section — honor it. Define jargon inline for newcomers; skip basics for handy owners. Keep `reason` short for terse owners, a touch more context for owners who like it. Factor in noted sensitivities (pets, kids, chemicals, fragrances) when picking what to suggest and how to phrase it.
  - If the profiles are mostly empty (early in the owner's journey), lean on season + weather + climate context — pruning windows for hardiness zone, weather-driven tasks, etc. — rather than fabricating profile details.
  - Categories are: exterior, interior, landscaping, systems, seasonal, followup.
  - If there's genuinely nothing worth suggesting right now, return an empty array. Better empty than padded.
 """
 
-    client = OpenAI()
     try:
-        resp = client.chat.completions.create(
+        resp = llm.chat_completion(
             model=RADAR_MODEL,
             messages=[{"role": "system", "content": sys_prompt}],
             response_format={
@@ -200,7 +197,7 @@ Hard rules:
         return []
 
     try:
-        payload = json.loads(resp.choices[0].message.content)
+        payload = json.loads(resp.text)
         suggestions = payload.get("suggestions") or []
     except Exception as e:  # noqa: BLE001
         print(f"[radar] response parse failed: {e}")

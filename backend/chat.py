@@ -27,10 +27,9 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
-from openai import OpenAI
-
-from . import profiles, radar, store
+from . import llm, profiles, radar, store
 
 # Chat is the user-facing brain — the success criterion "noticeably better
 # than ChatGPT" lives here. Use the strongest mini we can.
@@ -108,9 +107,10 @@ OFF_TOPIC_REPLY = (
 
 OUT_OF_CAPABILITY_REPLY = (
     "I can talk that through with you, but I can't do it myself — I "
-    "can't generate images, send messages, browse the live web, or "
-    "take actions out in the world. If you want to think through the "
-    "decision or what your next step is, I'm here for that."
+    "can't generate images, send messages or emails on your behalf, "
+    "control smart devices, place orders, or take other actions out "
+    "in the world. If you want to think through the decision or what "
+    "your next step is, I'm here for that."
 )
 
 
@@ -126,8 +126,11 @@ def classify_message_scope(user_message: str) -> tuple[str, str]:
         homework help, coding questions, dating, sports debates,
         unrelated work problems, current events, etc.
       - "out_of_capability": asks Captain to DO something it can't —
-        generate images, send emails / messages, browse the live web,
-        control smart devices, place orders, take actions in the world.
+        generate images, send emails / messages, control smart devices,
+        place orders, schedule appointments, take other actions in the
+        world. NOTE: Captain CAN browse the live web via an internal
+        search tool — web-lookup requests are in_scope, not
+        out_of_capability.
 
     `reason` is captured for server logs only; iOS sees only the canned
     user-facing reply for the gated cases.
@@ -142,9 +145,13 @@ def classify_message_scope(user_message: str) -> tuple[str, str]:
         "vendors, seasonal upkeep, neighborhood context, household "
         "routines, weather-aware decisions, and anything else where the "
         "user's home or life-as-a-homeowner is the subject.\n\n"
-        "Captain CAN reason and converse but CANNOT: generate images, "
-        "send messages or emails on the user's behalf, browse the live "
-        "web, control smart devices or appliances, place orders, schedule "
+        "Captain CAN reason and converse, see and reason about photos "
+        "the user attaches, and browse the live web through an internal "
+        "search tool (so questions like 'find me a plumber in Cleveland' "
+        "or 'are there current rebates for heat pumps in Ohio?' are "
+        "IN-SCOPE — Captain will search). Captain CANNOT: generate "
+        "images, send messages or emails on the user's behalf, control "
+        "smart devices or appliances, place orders, schedule "
         "appointments, or take any other actions out in the world.\n\n"
         "Classify the user's message into exactly one of:\n"
         "  - in_scope: about the home, its care, owner's home life, or "
@@ -162,8 +169,7 @@ def classify_message_scope(user_message: str) -> tuple[str, str]:
     )
 
     try:
-        client = OpenAI()
-        resp = client.chat.completions.create(
+        resp = llm.chat_completion(
             model=SCOPE_MODEL,
             messages=[{"role": "system", "content": sys_prompt}],
             response_format={
@@ -175,7 +181,7 @@ def classify_message_scope(user_message: str) -> tuple[str, str]:
                 },
             },
         )
-        payload = json.loads(resp.choices[0].message.content)
+        payload = json.loads(resp.text)
         return (
             payload.get("scope", "in_scope"),
             payload.get("reason", ""),
@@ -217,12 +223,19 @@ def _build_system_prompt(home: dict, calendar: list[dict],
 
 Identity and tone:
   - The home is the main character. The owner is its steward. You're its biographer.
-  - You speak in plain language; define jargon inline ONLY if the owner profile suggests they need it. If they've shown technical familiarity, skip basics.
   - You're calm and concrete, never barky or task-driven. You don't perform enthusiasm.
   - You help the owner *decide* what to do and *who* to call. You're a judgment layer, not a search engine.
   - You NEVER mention sale prices, market values, tax assessments, or any other financial valuation of the home. This app deliberately avoids financial surfaces.
   - You don't read the profiles back to the owner unless they ask — they don't want a recital, they want help.
   - When the owner shares a new fact about the home or themselves, acknowledge briefly and naturally — don't make a fuss about remembering it. The memory layer handles that silently in the background.
+
+Tone calibration (READ the OWNER profile carefully before responding — adjust on every dimension):
+  - **Jargon.** If the owner profile signals they're new to homeownership, or they've asked beginner questions like "what's a P-trap?", DEFINE technical terms inline the first time you use one in a thread ("the P-trap — the U-shaped bend under the sink that holds water to block sewer gas"). If the profile shows they've re-caulked a tub, swapped an outlet, soldered copper, or otherwise spoken as someone who works with their hands, SKIP the definitions — treat them as capable.
+  - **Length and density.** If the profile or the way the owner writes is terse ("yeah", "k", short fragments), keep your replies short — one tight paragraph or a few sentences. If they write in full conversational paragraphs or ask exploratory open-ended questions, you can stretch a bit — but never lecture.
+  - **Hand-holding.** New owners get a brief "here's why" alongside the "here's what." Experienced owners get the answer and trust to figure out the why themselves. Don't pad answers to capable owners with safety boilerplate they don't need.
+  - **Sensitivities.** If the profile notes pets, kids, chemical sensitivities, fragrance avoidance, or similar — factor that into every recommendation without being asked. Pet-safe yard products around a dog who sniffs the grass, low-VOC paints for a household with kids, etc.
+  - **Update on signal.** If the owner directly says "stop defining basics" or "you don't need to explain that" — adjust immediately. The memory layer captures this in the background; you act on it this turn.
+  - **Default when unknown.** Early in the relationship, before the profile has tone signals, lean lightly toward defining jargon and giving brief context — a first-time owner is the more common case, and an experienced owner will quickly correct.
 
 Today is {today}. Local time is approximately {local_time}.
 
@@ -595,7 +608,7 @@ def respond_to_message(
     home_id: int, user_message: str,
     image_paths: list[Path] | None = None,
     image_urls: list[str] | None = None,
-    on_stage: callable | None = None,
+    on_stage: Callable[..., None] | None = None,
     now: datetime | None = None,
 ) -> dict:
     """Foreground: call LLM with full context + web-search tool, persist
@@ -649,7 +662,6 @@ def respond_to_message(
     else:
         messages.append({"role": "user", "content": user_message})
 
-    client = OpenAI()
     searches: list[str] = []
     product_picks: list[dict] = []
     assistant_text = ""
@@ -666,17 +678,17 @@ def respond_to_message(
             [WEB_SEARCH_TOOL, FIND_PRODUCTS_TOOL]
             if round_idx < MAX_TOOL_ROUNDS else None
         )
-        resp = client.chat.completions.create(
+        resp = llm.chat_completion(
             model=CHAT_MODEL,
             messages=messages,
             tools=tools,
             temperature=0.7,
         )
-        choice = resp.choices[0].message
-        tool_calls = getattr(choice, "tool_calls", None) or []
+        choice = resp.raw
+        tool_calls = resp.tool_calls
 
         if not tool_calls:
-            assistant_text = choice.content or ""
+            assistant_text = resp.text
             break
 
         # Persist the assistant turn that holds the tool call(s). The
@@ -815,22 +827,24 @@ def explain_radar_item(
         f"sentences — what it is, why it's worth their attention (the "
         f"reasoning), when it matters, and a concrete next step or "
         f"two. Be specific to THIS home and THIS owner — reference "
-        f"what you know about them. Don't start with 'great question' "
-        f"or any throat-clearing — open with the explanation itself. "
-        f"End with one open invitation like 'want me to talk through "
-        f"the options?' or 'anything specific you want to dig into?' "
-        f"so the user knows they can follow up.\n\n"
+        f"what you know about them. Apply the tone-calibration rules "
+        f"from the system prompt: define jargon for newcomers, skip "
+        f"basics for capable owners, keep it tight for terse ones. "
+        f"Don't start with 'great question' or any throat-clearing — "
+        f"open with the explanation itself. End with one open "
+        f"invitation like 'want me to talk through the options?' or "
+        f"'anything specific you want to dig into?' so the user knows "
+        f"they can follow up.\n\n"
         f"THE ITEM:\n{item_text}"
     )
     messages.append({"role": "user", "content": kickoff})
 
-    client = OpenAI()
-    resp = client.chat.completions.create(
+    resp = llm.chat_completion(
         model=CHAT_MODEL,
         messages=messages,
         temperature=0.7,
     )
-    assistant_text = resp.choices[0].message.content or ""
+    assistant_text = resp.text
 
     store.add_message(conv_id, "assistant", assistant_text)
     return assistant_text
@@ -878,8 +892,7 @@ def extract_calendar_updates(home_id: int, user_message: str,
     )
 
     try:
-        client = OpenAI()
-        resp = client.chat.completions.create(
+        resp = llm.chat_completion(
             model=CALENDAR_MODEL,
             messages=[{"role": "system", "content": sys_prompt}],
             response_format={
@@ -891,7 +904,7 @@ def extract_calendar_updates(home_id: int, user_message: str,
                 },
             },
         )
-        updates = json.loads(resp.choices[0].message.content)
+        updates = json.loads(resp.text)
     except Exception as e:  # noqa: BLE001
         print(f"[calendar] extraction failed: {e}")
         return {"new_calendar_entries": []}
@@ -933,13 +946,19 @@ def update_memory_from_exchange(
         )
     except Exception as e:  # noqa: BLE001
         print(f"[memory] calendar extraction failed: {e}")
-    # Profiles or calendar may have changed — drop the radar cache so the
-    # next /radar call regenerates against the fresh context. Cheap to
-    # invalidate; the next foreground load will absorb a 2-5s LLM call.
+    # Profiles or calendar may have changed — drop the radar and
+    # biographer caches so the next /radar and /biographer calls
+    # regenerate against the fresh context. Cheap to invalidate; the
+    # next foreground load absorbs a 2-5s LLM call.
     try:
         radar.invalidate_cache()
     except Exception as e:  # noqa: BLE001
         print(f"[memory] radar cache invalidation failed: {e}")
+    try:
+        from . import biographer
+        biographer.invalidate_cache()
+    except Exception as e:  # noqa: BLE001
+        print(f"[memory] biographer cache invalidation failed: {e}")
 
 
 # ---------- fixture ----------

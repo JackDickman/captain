@@ -22,8 +22,19 @@ from typing import Any, Iterator
 DB_PATH = Path(__file__).parent / "captain.db"
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- v1: a single default row (id=1). Real auth + per-device tokens
+    -- arrive with the multi-tenancy migration (PRD §11.10). The column
+    -- set is intentionally tiny so the rest of the schema can carry a
+    -- user_id FK today without committing to an auth shape.
+    display_name TEXT,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS home (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL DEFAULT 1,
     address TEXT NOT NULL,
     palette_json TEXT,            -- JSON array of hex strings
     current_rendering_url TEXT,
@@ -33,7 +44,8 @@ CREATE TABLE IF NOT EXISTS home (
     lat REAL,
     lng REAL,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
 CREATE TABLE IF NOT EXISTS features (
@@ -100,7 +112,28 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
+
+CREATE TABLE IF NOT EXISTS events (
+    -- Lightweight usage telemetry. Used to measure PRD §13 success
+    -- criteria (weekly opens, first-session-under-five-minutes, etc.)
+    -- and to debug regressions. Payload is freeform JSON so iOS can
+    -- attach context without schema churn.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL DEFAULT 1,
+    home_id INTEGER,
+    event_type TEXT NOT NULL,
+    payload_json TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (home_id) REFERENCES home(id)
+);
+CREATE INDEX IF NOT EXISTS idx_events_user_type
+    ON events(user_id, event_type, created_at);
 """
+
+# v1: every row lives under this single user. When auth lands, this
+# helper is the seam to replace — callers don't hardcode the id.
+DEFAULT_USER_ID = 1
 
 
 @contextmanager
@@ -126,11 +159,23 @@ def init_db() -> None:
             "ALTER TABLE messages ADD COLUMN product_picks TEXT",
             "ALTER TABLE messages ADD COLUMN searches TEXT",
             "ALTER TABLE hunt_progress ADD COLUMN notes_source TEXT",
+            # Multi-tenancy prep (PRD §11.10): existing pre-migration
+            # home rows get DEFAULT 1 so they continue to belong to the
+            # single v1 user.
+            "ALTER TABLE home ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1",
         ]:
             try:
                 c.execute(ddl)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Seed the single v1 user if it doesn't exist yet. CONFLICT(id)
+        # is a no-op on re-init.
+        c.execute(
+            """INSERT INTO users (id, display_name, created_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(id) DO NOTHING""",
+            (DEFAULT_USER_ID, "Captain user", time.time()),
+        )
 
 
 # ---------- home ----------
@@ -145,6 +190,7 @@ def upsert_home(
     job_id: str,
     lat: float | None = None,
     lng: float | None = None,
+    user_id: int = DEFAULT_USER_ID,
 ) -> int:
     """Replace the single home row. Returns its id."""
     now = time.time()
@@ -152,12 +198,12 @@ def upsert_home(
         row = c.execute("SELECT id, created_at FROM home LIMIT 1").fetchone()
         if row is None:
             cur = c.execute(
-                """INSERT INTO home (address, palette_json,
+                """INSERT INTO home (user_id, address, palette_json,
                                      current_rendering_url, renderings_json,
                                      current_season, job_id, lat, lng,
                                      created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (address, json.dumps(palette), current_rendering_url,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, address, json.dumps(palette), current_rendering_url,
                  json.dumps(renderings), current_season, job_id, lat, lng,
                  now, now),
             )
@@ -499,6 +545,100 @@ def upsert_hunt_item(
                     photo_url, now,
                 ),
             )
+
+
+# ---------- events (telemetry) ----------
+
+def log_event(
+    event_type: str,
+    *,
+    home_id: int | None = None,
+    payload: dict | None = None,
+    user_id: int = DEFAULT_USER_ID,
+) -> int:
+    """Append one telemetry row. Cheap, fire-and-forget — callers should
+    not let event-log failures break the user-facing path, so internal
+    errors are swallowed and printed.
+
+    `event_type` is a stable string (e.g. 'app_open', 'chat_turn',
+    'hunt_item_done'); `payload` is freeform JSON-encodable dict. Used
+    to measure PRD §13 success criteria."""
+    try:
+        with connect() as c:
+            cur = c.execute(
+                """INSERT INTO events
+                     (user_id, home_id, event_type, payload_json, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    user_id, home_id, event_type,
+                    json.dumps(payload) if payload else None,
+                    time.time(),
+                ),
+            )
+            return cur.lastrowid
+    except Exception as e:  # noqa: BLE001
+        print(f"[events] log_event({event_type!r}) failed: {e}")
+        return -1
+
+
+def get_events(
+    *, event_type: str | None = None, limit: int = 200,
+    user_id: int = DEFAULT_USER_ID,
+) -> list[dict]:
+    """Recent events, newest-first. Used by /debug/events for inspection."""
+    with connect() as c:
+        if event_type:
+            rows = c.execute(
+                """SELECT id, event_type, home_id, payload_json, created_at
+                   FROM events
+                   WHERE user_id = ? AND event_type = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (user_id, event_type, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                """SELECT id, event_type, home_id, payload_json, created_at
+                   FROM events WHERE user_id = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (user_id, limit),
+            ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop("payload_json", None)
+        if raw:
+            try:
+                d["payload"] = json.loads(raw)
+            except json.JSONDecodeError:
+                d["payload"] = None
+        else:
+            d["payload"] = None
+        out.append(d)
+    return out
+
+
+def event_counts(
+    *, since: float | None = None, user_id: int = DEFAULT_USER_ID,
+) -> dict[str, int]:
+    """Aggregate counts by event_type, optionally bounded by `since`
+    (unix epoch). Used by /debug/events/summary for quick monitoring."""
+    with connect() as c:
+        if since is None:
+            rows = c.execute(
+                """SELECT event_type, COUNT(*) AS n
+                   FROM events WHERE user_id = ?
+                   GROUP BY event_type""",
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                """SELECT event_type, COUNT(*) AS n
+                   FROM events
+                   WHERE user_id = ? AND created_at >= ?
+                   GROUP BY event_type""",
+                (user_id, since),
+            ).fetchall()
+    return {r["event_type"]: r["n"] for r in rows}
 
 
 def delete_calendar_entry(home_id: int, entry_id: int) -> bool:

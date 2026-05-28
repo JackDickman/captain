@@ -1,7 +1,7 @@
 # Captain — Product Requirements Document (v1)
 
-**Version:** 1.2
-**Last updated:** May 27, 2026
+**Version:** 1.3
+**Last updated:** May 28, 2026
 **Status:** Draft — personal pet project, under active build
 
 ---
@@ -191,6 +191,8 @@ In v1, this is auto-populated from chat and photos. Calendar entries are text-ba
 
 The calendar is the single source of truth for both what *was* done and what's coming up.
 
+**Biographer surfaces — Captain occasionally speaks unbidden.** The calendar isn't just a log; it's the source the home's biographer draws on. When a calendar entry's date lines up with today (one or more years ago, within a small day window), the home screen carries a single quiet "on this day" line above the chat input — written fresh each day by a small LLM call against the matched entry. On most days there's nothing to say (especially early in a home's history) and the surface renders nothing, which is correct. When it does appear, it should feel like a friend noticing an anniversary, not a notification. Implementation: `backend/biographer.py` + `GET /biographer`, cached 24h, invalidated whenever the calendar changes. The line is intentionally short (under ~16 words), italic, and tone-calibrated against the owner profile.
+
 ### 6.8 Notifications
 
 Two per week, opt-in, ideally on by default but easy to silence:
@@ -292,7 +294,7 @@ No tab bar. No hamburger menu. No back buttons except where iOS conventions requ
 ### 7.9 Risks and things to validate
 
 - **Rendered home quality.** The biggest bet. If renderings are inconsistent or unflattering across home types, the central emotional hook falls apart. Worth prototyping with several real home photos before committing.
-- **Gesture discoverability.** A heavily gesture-driven UI can be confusing for less-technical users. Subtle affordances (visible handles, brief hint animations on first launch) will be important.
+- **Gesture discoverability.** A heavily gesture-driven UI can be confusing for less-technical users. v1 ships a one-time decaying brass-ring affordance (the "gesture hint") on the radar card and the corner avatar, persisted per device in `UserDefaults` and re-armed on `AppState.reset()`. Implementation: `ios/Captain/Util/GestureHint.swift` + `.gestureHint(.key)` view modifier. New hinted surfaces add a `Key` case and one modifier line at the callsite.
 - **Feeling "thin."** A single-screen app can feel like there's not much to it. The rendered home, the accumulating record, and the responsive seasonal/weather updates are the antidotes — but they need to be strong enough to carry that weight.
 
 ## 8. Example use cases
@@ -347,9 +349,10 @@ Captain depends on external data and services to feel intelligent and tailored. 
 
 These are required for the app to function at all.
 
-- **LLM provider with vision and tool use.** The model powers chat, image extraction, web search reasoning, and digest generation. The architecture must keep the underlying LLM swappable behind a thin abstraction layer so the model (and provider) can be changed easily as costs shift or better models ship. Captain should not be tightly coupled to any one vendor's SDK or prompt format.
+- **LLM provider with vision and tool use.** The model powers chat, image extraction, web search reasoning, and digest generation. The architecture keeps the underlying LLM swappable behind a thin abstraction layer (`backend/llm.py`) so the model (and provider) can be changed easily as costs shift or better models ship. All callsites in `chat.py`, `profiles.py`, `radar.py`, `hunt.py`, and `biographer.py` go through `llm.chat_completion(...)` (OpenAI-shaped surface — chosen because every callsite was already written against it and vision payloads use the OpenAI image_url shape). Provider selection is per env var (`CAPTAIN_LLM_PROVIDER`, defaults to `openai`); adding Anthropic is a single module change with no callsite churn. `render_prototype.py` and `first_session.py` still call OpenAI directly because they use the image-generation API and a passed-in client, respectively — extending the abstraction to cover those is a small future change.
 - **Authentication and accounts.** Basic auth is required so users don't lose their home profile if they reinstall or get a new phone. A managed auth service (e.g., Clerk, Supabase Auth, Firebase Auth) is preferable to rolling our own.
-- **Database.** Stores the home profile, personal profile, calendar entries, and chat history.
+- **Database.** Stores the home profile, personal profile, calendar entries, and chat history. The schema carries a `users` table and a `user_id` foreign key on `home` from v1, even though every row sits under a single default user (`DEFAULT_USER_ID = 1`). This is prophylactic structure for the multi-tenancy migration in §11.10 — adding the column at v1 cost a few lines; retrofitting it later would compound across every query.
+- **Usage telemetry.** A small `events` table (`event_type`, optional JSON `payload`, `user_id`, `home_id`, timestamp) records the minimum signal needed to measure §13 success criteria — `home_screen_view`, `first_session_start`, `first_session_done` (with elapsed seconds), `chat_turn`, `hunt_item_done`, `radar_card_open`, `radar_item_tap`, `profile_drawer_open`. Server-side events are logged from the handlers directly; client-side events go through `POST /events` (fire-and-forget on iOS). Inspect via `GET /debug/events` (dev convenience). No third-party analytics SDK in v1 — keeps things private at the pet-project tier and lets us defer the analytics-vendor decision.
 - **Push notifications.** APNs via a managed service (e.g., OneSignal, Firebase, Expo) for the Friday and Monday digests.
 
 ### 9.2 In v1 — data and context
@@ -474,7 +477,7 @@ What makes this hard the right way:
 - **Notifications.** The Friday + Monday digests (§6.8) should fan out per person, calibrated to each personal profile's tone and timing preferences, but pulling from one shared home + calendar.
 - **The "biographer's instinct" stays singular.** Captain still speaks *about the home* in one voice. It just learns who's talking on each turn and adjusts how it speaks back.
 
-Worth designing the data model with this in mind sooner rather than later — even before the feature ships — because retrofitting multi-tenancy onto a single-user schema is the kind of thing that compounds in pain over time. The current single-home / single-conversation simplifications in v1 (see backend/store.py) should be expected to evolve.
+Worth designing the data model with this in mind sooner rather than later — even before the feature ships — because retrofitting multi-tenancy onto a single-user schema is the kind of thing that compounds in pain over time. The current single-home / single-conversation simplifications in v1 (see backend/store.py) should be expected to evolve. Some of that prep is already in: v1 carries a `users` table and a `user_id` FK on `home`; the profile rewriter is serialized by a per-process `threading.Lock` in `backend/profiles.py` so concurrent chat turns can't race the read-modify-write of `home.md` / `user.md` (when multi-home arrives, swap to a `dict[home_id, Lock]`). What's still pending: auth, per-home scoping on the in-memory job tables (`_jobs`, `_chat_jobs`, `_prerenders`), per-user push-notification routing, and the shared-chat-vs-separate question above.
 
 Related: the house passport (§11.1) is the *handoff* version of this same shape — many people over the home's lifetime, ownership changes hands. Multi-user is the *concurrent* version.
 

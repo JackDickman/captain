@@ -20,6 +20,9 @@ struct HomeView: View {
     @State private var radar: RadarResponse?
     @State private var radarLoading = true
     @State private var hunt: HuntResponse?
+    /// Captain's optional "on this day" recall line. nil on most days for
+    /// a young home; surfaces only when the calendar has an anniversary.
+    @State private var biographer: BiographerRecall?
     /// Set by RadarView's tap callback right before it dismisses; the
     /// sheet's onDismiss reads this to decide whether to open chat.
     @State private var pendingRadarKickoff: RadarKickoff?
@@ -77,6 +80,12 @@ struct HomeView: View {
         .task { await loadWeather() }
         .task { await loadRadar() }
         .task { await loadHunt() }
+        .task { await loadBiographer() }
+        .task {
+            // PRD §13 success criterion: weekly opens. Logged once per
+            // appearance; the backend de-noises in aggregation.
+            await CaptainAPI.logEvent("home_screen_view")
+        }
         .onAppear {
             let args = ProcessInfo.processInfo.arguments
             // Debug: launch with --auto-chat / --show-profile to open the
@@ -114,6 +123,10 @@ struct HomeView: View {
         }
     }
 
+    private func loadBiographer() async {
+        biographer = await CaptainAPI.fetchBiographer()
+    }
+
     // MARK: - Background
 
     private var background: some View {
@@ -146,11 +159,29 @@ struct HomeView: View {
                         .padding(.horizontal, 24)
                     Spacer().frame(height: 10)
                     RadarStrip(radar: radar, isLoading: radarLoading) {
-                        if radar != nil { radarPresented = true }
+                        if radar != nil {
+                            radarPresented = true
+                            GestureHint.markDiscovered(.radarCard)
+                            Task {
+                                await CaptainAPI.logEvent(
+                                    "radar_card_open"
+                                )
+                            }
+                        }
                     }
                     .padding(.horizontal, 24)
+                    .gestureHint(.radarCard)
                     Spacer().frame(height: 12)
                 }
+            }
+            // Biographer line — Captain speaking unbidden when the home
+            // has a calendar anniversary today. Sits just above the chat
+            // capsule so it reads as a quiet aside, not a header.
+            if let biographer {
+                biographerLine(biographer)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 8)
+                    .transition(.opacity)
             }
             // Bottom chat capsule sits inline in the column now (no
             // walnut surface beneath it) — the cream background runs
@@ -159,6 +190,24 @@ struct HomeView: View {
             chatCapsule
                 .padding(.horizontal, 20)
                 .padding(.bottom, 12)
+        }
+    }
+
+    /// Quiet, decorative "on this day" line. Italics + muted tone so it
+    /// reads as an aside, not an instruction. Single line, truncates
+    /// rather than wraps — Captain shouldn't dominate the home screen.
+    private func biographerLine(_ recall: BiographerRecall) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "book.closed.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(CaptainTheme.brass.opacity(0.7))
+            Text(recall.text)
+                .font(CaptainTheme.body(13))
+                .italic()
+                .foregroundStyle(CaptainTheme.textMuted)
+                .lineLimit(2)
+                .minimumScaleFactor(0.9)
+            Spacer(minLength: 0)
         }
     }
 
@@ -202,6 +251,10 @@ struct HomeView: View {
                 .lineLimit(1)
             Button {
                 profilePresented = true
+                GestureHint.markDiscovered(.cornerAvatar)
+                Task {
+                    await CaptainAPI.logEvent("profile_drawer_open")
+                }
             } label: {
                 Image(systemName: "person.crop.circle.fill")
                     .font(.system(size: 22))
@@ -215,6 +268,7 @@ struct HomeView: View {
                         )
                     )
             }
+            .gestureHint(.cornerAvatar)
         }
         .padding(.horizontal, 26)
         .padding(.top, 20)

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from openai import OpenAI
+from . import llm
 
 
 # Vision extraction over uploaded docs. Mini gives us solid OCR + spatial
@@ -613,9 +613,7 @@ def _build_docs_prompt() -> str:
     )
 
 
-def extract_from_documents(
-    client: OpenAI, photo_paths: list[Path],
-) -> list[dict]:
+def extract_from_documents(photo_paths: list[Path]) -> list[dict]:
     """Send all uploaded document photos to the vision LLM and ask for
     structured extractions. Returns a list of {item_id, notes} dicts —
     only items where the model found real info. Errors and malformed
@@ -651,7 +649,7 @@ def extract_from_documents(
         return []
 
     try:
-        resp = client.chat.completions.create(
+        resp = llm.chat_completion(
             model=DOCS_MODEL,
             messages=[{"role": "user", "content": content}],
             response_format={
@@ -668,7 +666,7 @@ def extract_from_documents(
         return []
 
     try:
-        payload = json.loads(resp.choices[0].message.content or "{}")
+        payload = json.loads(resp.text or "{}")
         extractions = payload.get("extractions") or []
     except (json.JSONDecodeError, KeyError, AttributeError) as e:
         print(f"[hunt-docs] response parse failed: {e}")

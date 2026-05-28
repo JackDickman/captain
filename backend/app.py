@@ -61,6 +61,7 @@ from first_session import (  # noqa: E402
 )
 from backend import (  # noqa: E402
     store, profiles, chat as chat_mod, geocode, radar, hunt as hunt_mod,
+    biographer,
 )
 
 RENDERED_DIR = Path(__file__).parent / "rendered"
@@ -221,7 +222,10 @@ def _run_prerender(
             if pr is not None:
                 pr["render_path"] = str(path) if path else None
                 pr["error"] = err
-        elapsed = time.time() - _prerenders[prefetch_id]["started_at"]
+                started_at = pr["started_at"]
+            else:
+                started_at = time.time()
+        elapsed = time.time() - started_at
         if path:
             print(f"[prerender] {prefetch_id} rendered {season} in "
                   f"{elapsed:.1f}s")
@@ -336,6 +340,14 @@ def _finish_job(job_id: str, result: dict) -> None:
             job["message"] = "Ready"
             job["result"] = result
             job["finished_at"] = time.time()
+            elapsed = job["finished_at"] - job.get("started_at", job["finished_at"])
+        else:
+            elapsed = 0.0
+    # Tracks PRD §13 "first session under five minutes" success criterion.
+    store.log_event(
+        "first_session_done",
+        payload={"job_id": job_id, "elapsed_seconds": round(elapsed, 1)},
+    )
 
 
 def _fail_job(job_id: str, error: str) -> None:
@@ -580,6 +592,10 @@ async def first_session(
             shutil.copyfileobj(photo.file, f)
 
     _create_job(job_id)
+    store.log_event(
+        "first_session_start",
+        payload={"job_id": job_id, "prefetch": bool(prefetch_id)},
+    )
     threading.Thread(
         target=_run_first_session_job,
         args=(job_id, address, photo_path, job_dir),
@@ -665,6 +681,17 @@ def _finish_chat_job(chat_id: str, result: dict) -> None:
         job["stage_label"] = "Ready"
         job["result"] = result
         job["finished_at"] = time.time()
+        elapsed = job["finished_at"] - job.get("started_at", job["finished_at"])
+    home = store.get_home()
+    store.log_event(
+        "chat_turn",
+        home_id=(home or {}).get("id"),
+        payload={
+            "elapsed_seconds": round(elapsed, 1),
+            "searches": len(result.get("searches") or []),
+            "product_picks": len(result.get("product_picks") or []),
+        },
+    )
 
 
 def _fail_chat_job(chat_id: str, error: str) -> None:
@@ -765,7 +792,6 @@ def _ensure_home_for_chat() -> int:
     if home:
         return home["id"]
     # Seed from fixture data so dev flow works without first-session.
-    fixture = chat_mod  # just for module ref; data below is canonical fixture
     return store.upsert_home(
         address="4221 Silsby Rd, University Heights, OH 44118",
         palette=["#b22222", "#ffffff", "#a9a9a9",
@@ -960,6 +986,11 @@ async def explain_radar_item(
     conv_id = store.get_or_create_conversation(home["id"])
     latest = store.get_recent_messages(conv_id, limit=1)
     msg_id = latest[0]["id"] if latest else -1
+    store.log_event(
+        "radar_item_tap",
+        home_id=home["id"],
+        payload={"item_type": item_type},
+    )
     return {"message_id": msg_id, "response": text}
 
 
@@ -1048,13 +1079,17 @@ def delete_calendar_entry(entry_id: int) -> dict:
     ok = store.delete_calendar_entry(home["id"], entry_id)
     if not ok:
         raise HTTPException(404, f"calendar entry {entry_id} not found")
-    # Calendar changed → invalidate the radar cache so the next /radar
-    # call regenerates against the updated set.
+    # Calendar changed → invalidate the radar + biographer caches so
+    # the next /radar and /biographer calls regenerate.
     try:
         from . import radar
         radar.invalidate_cache()
     except Exception as e:  # noqa: BLE001
         print(f"[calendar] radar cache invalidation failed: {e}")
+    try:
+        biographer.invalidate_cache()
+    except Exception as e:  # noqa: BLE001
+        print(f"[calendar] biographer cache invalidation failed: {e}")
     return {"deleted": entry_id}
 
 
@@ -1189,6 +1224,14 @@ async def complete_hunt_item(
         home["id"], item_id, "done",
         notes=notes or None, photo_url=photo_url,
     )
+    store.log_event(
+        "hunt_item_done",
+        home_id=home["id"],
+        payload={
+            "item_id": item_id, "category": item.category,
+            "had_photo": photo_path is not None,
+        },
+    )
 
     # Fold the captured info into the home/owner profile via the same
     # rewriter the chat uses. We synthesize an exchange so the rewriter
@@ -1285,9 +1328,8 @@ async def upload_hunt_documents(
     if not saved_paths:
         raise HTTPException(400, "no valid document photos uploaded")
 
-    client = OpenAI()
     try:
-        extractions = hunt_mod.extract_from_documents(client, saved_paths)
+        extractions = hunt_mod.extract_from_documents(saved_paths)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         raise HTTPException(500, f"extraction failed: {e}") from e
@@ -1332,6 +1374,61 @@ def reset_hunt_item(item_id: str) -> dict:
         raise HTTPException(400, "no home yet")
     store.upsert_hunt_item(home["id"], item_id, "pending")
     return _hunt_state_payload(home["id"])
+
+
+@app.get("/biographer")
+def get_biographer(
+    refresh: bool = False,
+    x_captain_local_time: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """One quiet 'on this day' line for the home screen, or null when
+    nothing in the home's past lines up with today (the common case for
+    a young home). 24-hour cached. iOS shows the line above the chat
+    capsule when present; renders nothing when null."""
+    home = store.get_home()
+    if not home:
+        return {"recall": None}
+    user_now = _parse_local_time(x_captain_local_time)
+    recall = biographer.get_recall(
+        home["id"], now=user_now, refresh=refresh,
+    )
+    return {"recall": recall}
+
+
+@app.post("/events")
+async def post_event(
+    event_type: Annotated[str, Form()],
+    payload: Annotated[Optional[str], Form()] = None,
+) -> dict:
+    """iOS-driven telemetry events (app open, screen view, gesture
+    discovered, etc.). The backend logs hard events on its own — this
+    endpoint is the iOS side of the same pipe. `payload` is an optional
+    JSON-encoded string; the server stores it verbatim if parseable.
+
+    Fire-and-forget on the iOS side: failure should never block the user.
+    Returns {ok: true} or {ok: false} so logs aren't completely silent.
+    """
+    parsed: dict | None = None
+    if payload:
+        try:
+            parsed = json.loads(payload)
+            if not isinstance(parsed, dict):
+                parsed = {"value": parsed}
+        except json.JSONDecodeError:
+            parsed = {"raw": payload[:500]}
+    home = store.get_home()
+    home_id = home["id"] if home else None
+    eid = store.log_event(event_type, home_id=home_id, payload=parsed)
+    return {"ok": eid > 0, "event_id": eid}
+
+
+@app.get("/debug/events")
+def debug_events(event_type: Optional[str] = None, limit: int = 50) -> dict:
+    """Recent telemetry events (dev convenience, no auth)."""
+    return {
+        "events": store.get_events(event_type=event_type, limit=limit),
+        "counts": store.event_counts(),
+    }
 
 
 @app.get("/debug/state")

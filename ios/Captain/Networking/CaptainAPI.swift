@@ -748,6 +748,61 @@ enum CaptainAPI {
         }
     }
 
+    /// GET /biographer — Captain's "on this day" recall line for the home
+    /// screen, if one fits today. Returns nil when there's nothing to say
+    /// (the common case for a young home). Failures soft-fail to nil so
+    /// the home screen never breaks on a network blip.
+    static func fetchBiographer() async -> BiographerRecall? {
+        let url = baseURL.appendingPathComponent("biographer")
+        let request = makeRequest(url: url)
+        do {
+            let (data, response) = try await URLSession.shared
+                .data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else {
+                return nil
+            }
+            return try JSONDecoder()
+                .decode(BiographerResponse.self, from: data).recall
+        } catch {
+            return nil
+        }
+    }
+
+    /// POST /events — fire-and-forget client telemetry. Never throws;
+    /// silent failure is correct for a non-user-facing pipe. Used to
+    /// measure PRD §13 success criteria.
+    static func logEvent(
+        _ type: String, payload: [String: Any]? = nil,
+    ) async {
+        let url = baseURL.appendingPathComponent("events")
+        var request = makeRequest(url: url)
+        request.httpMethod = "POST"
+        let boundary = "Boundary-\(UUID().uuidString)"
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.timeoutInterval = 5
+
+        var body = Data()
+        func append(_ s: String) { body.append(s.data(using: .utf8)!) }
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"event_type\"\r\n\r\n")
+        append("\(type)\r\n")
+        if let payload,
+           let data = try? JSONSerialization.data(withJSONObject: payload),
+           let s = String(data: data, encoding: .utf8) {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"payload\"\r\n\r\n")
+            append("\(s)\r\n")
+        }
+        append("--\(boundary)--\r\n")
+        request.httpBody = body
+
+        _ = try? await URLSession.shared.data(for: request)
+    }
+
     /// GET /messages — full conversation history. Used to hydrate the chat
     /// view on launch / when ChatView first appears.
     static func fetchMessages() async throws -> [ChatMessage] {

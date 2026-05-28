@@ -43,6 +43,8 @@ final class AppState: ObservableObject {
     func reset() {
         firstSession = nil
         UserDefaults.standard.removeObject(forKey: storageKey)
+        // Re-arm gesture hints so a re-onboarded user sees them again.
+        GestureHint.resetAll()
     }
 
     private func save() {

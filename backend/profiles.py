@@ -31,10 +31,18 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
-from openai import OpenAI
+from . import llm
+
+# Per-home rewrite serialization. The rewriter does read-modify-write on
+# home.md / user.md, so two concurrent chat turns racing the same files
+# would drop one turn's update. v1 has one home → a single Lock is fine;
+# when multi-home arrives, swap to a dict[home_id, Lock]. The lock spans
+# the whole LLM call so both reads + writes happen atomically per home.
+_rewrite_lock = threading.Lock()
 
 PROFILES_DIR = Path(__file__).parent / "profiles"
 HISTORY_DIR = PROFILES_DIR / "history"
@@ -188,7 +196,20 @@ def update_profiles_from_exchange(
 ) -> dict:
     """Background: ask the LLM to integrate anything new from the latest
     exchange into the home + user markdown profiles. Returns the structured
-    response from the model (or {} on failure)."""
+    response from the model (or {} on failure).
+
+    Serialized by `_rewrite_lock` so two background turns landing close
+    together can't race the read-modify-write of home.md / user.md."""
+    with _rewrite_lock:
+        return _update_profiles_locked(
+            user_message, assistant_message, image_paths,
+        )
+
+
+def _update_profiles_locked(
+    user_message: str, assistant_message: str,
+    image_paths: list[Path] | None = None,
+) -> dict:
     home_md = read_home_md()
     user_md = read_user_md()
 
@@ -219,6 +240,24 @@ def update_profiles_from_exchange(
         "dog\" is weak. \"Jackie, an 8-year-old female yellow lab who "
         "sniffs the ground constantly, so the owner avoids lawn "
         "chemicals\" is what we want.\n"
+        " - CAPTURE TONE SIGNALS in the OWNER PROFILE under a "
+        "\"Communication\" section. Maintain it as plain prose, not a "
+        "checklist. Watch for and integrate:\n"
+        "     * jargon level — beginner questions (\"what's a P-trap?\") "
+        "vs. casual technical talk (re-caulking, soldering, swapping a "
+        "GFCI). Note which side they're on and update when evidence "
+        "shifts.\n"
+        "     * preferred length — terse one-word replies suggest they "
+        "want short answers; conversational paragraphs suggest they're "
+        "fine with a bit more.\n"
+        "     * direct preferences — \"stop explaining the basics\", "
+        "\"just give me the steps\", \"I want more context\" should be "
+        "recorded verbatim or near-verbatim so future chats honor them.\n"
+        "     * sensitivities — chemical, fragrance, dust, noise, "
+        "anything they want avoided. Always relevant to recommendations.\n"
+        "   When tone evidence contradicts what's already there (e.g. a "
+        "newcomer who's now done several DIY projects), UPDATE the "
+        "Communication section — don't just append a contradicting line.\n"
         " - REFINE existing facts with new detail. If the document already "
         "mentions a dog and the exchange reveals the dog's name and "
         "breed, INTEGRATE that into the existing mention — don't add a "
@@ -264,9 +303,8 @@ def update_profiles_from_exchange(
     else:
         chat_messages = [{"role": "system", "content": sys_prompt}]
 
-    client = OpenAI()
     try:
-        resp = client.chat.completions.create(
+        resp = llm.chat_completion(
             model=UPDATE_MODEL,
             messages=chat_messages,
             response_format={
@@ -282,7 +320,11 @@ def update_profiles_from_exchange(
         print(f"[profiles] update call failed: {e}")
         return {}
 
-    payload = json.loads(resp.choices[0].message.content)
+    try:
+        payload = json.loads(resp.text or "{}")
+    except (json.JSONDecodeError, AttributeError) as e:
+        print(f"[profiles] response parse failed: {e}")
+        return {}
 
     new_home = (payload.get("home_md") or "").strip()
     new_user = (payload.get("user_md") or "").strip()
