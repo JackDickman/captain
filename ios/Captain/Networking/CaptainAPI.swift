@@ -318,12 +318,20 @@ enum CaptainAPI {
     /// "done" or "error". The polling carries stage updates so the iOS
     /// chat surface can show "Captain is checking the web for X…" while
     /// a tool call is in flight.
+    ///
+    /// `conversationId` pins this turn to a specific thread (a past
+    /// conversation the user resumed from the history list). Pass nil
+    /// to let the backend route to the active conversation per the
+    /// active-window rule.
     static func sendChatMessage(
         _ text: String,
         photos: [Data] = [],
+        conversationId: Int? = nil,
         onStage: @MainActor @escaping (ChatStage) -> Void = { _ in }
     ) async throws -> ChatResponse {
-        let kickoff = try await postChatKickoff(text: text, photos: photos)
+        let kickoff = try await postChatKickoff(
+            text: text, photos: photos, conversationId: conversationId,
+        )
         if let result = kickoff.result {
             return result  // fixture / scope-gated path, no polling needed
         }
@@ -373,6 +381,7 @@ enum CaptainAPI {
     /// poll on.
     private static func postChatKickoff(
         text: String, photos: [Data],
+        conversationId: Int? = nil,
     ) async throws -> ChatKickoff {
         let url = baseURL.appendingPathComponent("chat")
         let boundary = "Boundary-\(UUID().uuidString)"
@@ -395,6 +404,14 @@ enum CaptainAPI {
         appendString("--\(boundary)\r\n")
         appendString("Content-Disposition: form-data; name=\"message\"\r\n\r\n")
         appendString("\(text)\r\n")
+
+        if let conversationId {
+            appendString("--\(boundary)\r\n")
+            appendString(
+                "Content-Disposition: form-data; name=\"conversation_id\"\r\n\r\n"
+            )
+            appendString("\(conversationId)\r\n")
+        }
 
         for (i, photo) in photos.enumerated() {
             let compressed = compressForUpload(photo, maxDim: 1280)
@@ -475,6 +492,7 @@ enum CaptainAPI {
     /// optimistically before re-fetching full history.
     static func explainRadarItem(
         itemType: String, itemText: String,
+        conversationId: Int? = nil,
     ) async throws -> ChatResponse {
         let url = baseURL.appendingPathComponent("chat/radar-explain")
         let boundary = "Boundary-\(UUID().uuidString)"
@@ -503,6 +521,13 @@ enum CaptainAPI {
             "Content-Disposition: form-data; name=\"item_text\"\r\n\r\n"
         )
         appendString("\(itemText)\r\n")
+        if let conversationId {
+            appendString("--\(boundary)\r\n")
+            appendString(
+                "Content-Disposition: form-data; name=\"conversation_id\"\r\n\r\n"
+            )
+            appendString("\(conversationId)\r\n")
+        }
         appendString("--\(boundary)--\r\n")
         request.httpBody = body
 
@@ -803,11 +828,26 @@ enum CaptainAPI {
         _ = try? await URLSession.shared.data(for: request)
     }
 
-    /// GET /messages — full conversation history. Used to hydrate the chat
-    /// view on launch / when ChatView first appears.
-    static func fetchMessages() async throws -> [ChatMessage] {
-        let url = baseURL.appendingPathComponent("messages")
-        let request = makeRequest(url: url)
+    /// GET /messages — full conversation history. Used to hydrate the
+    /// chat view on launch / when ChatView first appears. With no
+    /// `conversationId`, returns the active conversation (today's
+    /// thread); with one, returns that specific thread. Returns both
+    /// the messages and the conversation id so the caller can pin its
+    /// state without a second round-trip.
+    static func fetchMessages(
+        conversationId: Int? = nil,
+    ) async throws -> MessagesResponse {
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("messages"),
+            resolvingAgainstBaseURL: false
+        )!
+        if let conversationId {
+            components.queryItems = [
+                URLQueryItem(name: "conversation_id",
+                             value: String(conversationId))
+            ]
+        }
+        let request = makeRequest(url: components.url!)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw APIError.badStatus(-1, "no http response")
@@ -818,9 +858,54 @@ enum CaptainAPI {
         }
         do {
             return try JSONDecoder().decode(MessagesResponse.self, from: data)
-                .messages
         } catch {
             throw APIError.decoding(error)
         }
+    }
+
+    // MARK: - Conversations
+
+    /// GET /conversations — all conversations for this home, newest
+    /// activity first. Used by the chat surface's history list.
+    static func fetchConversations() async throws -> [ConversationSummary] {
+        let url = baseURL.appendingPathComponent("conversations")
+        let request = makeRequest(url: url)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.expectOK(response, data)
+        do {
+            return try JSONDecoder()
+                .decode(ConversationListResponse.self, from: data)
+                .conversations
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// POST /conversations — start a fresh thread on demand from the
+    /// history list's "new conversation" button.
+    static func createConversation() async throws -> ConversationSummary {
+        let url = baseURL.appendingPathComponent("conversations")
+        var request = makeRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.expectOK(response, data)
+        do {
+            return try JSONDecoder()
+                .decode(ConversationSummary.self, from: data)
+        } catch {
+            throw APIError.decoding(error)
+        }
+    }
+
+    /// DELETE /conversations/{id} — remove one thread + its messages.
+    /// Used by swipe-to-delete on a history row.
+    static func deleteConversation(_ id: Int) async throws {
+        let url = baseURL.appendingPathComponent("conversations/\(id)")
+        var request = makeRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = 10
+        let (_, response) = try await URLSession.shared.data(for: request)
+        try Self.expectOK(response, nil)
     }
 }

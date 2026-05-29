@@ -1,6 +1,6 @@
 # Captain — Product Requirements Document (v1)
 
-**Version:** 1.3
+**Version:** 1.4
 **Last updated:** May 28, 2026
 **Status:** Draft — personal pet project, under active build
 
@@ -162,6 +162,8 @@ Chat is the workhorse but not the front door. The home screen is the home.
 Every chat photo also enriches the home profile and may produce a calendar entry as a side effect.
 
 **Photo input — library or camera.** The chat input's brass camera button opens a quick menu: pick from the photo library (multi-select, ordered) or take a photo in-app right now. Captures and library picks stack into a single pending strip so a user can mix sources within one message. Both flows hit the same vision extraction pipeline.
+
+**Conversation history — threads, not an endless scroll.** Chat is broken into discrete conversations so a year-long history doesn't collapse into one wall of text — both for the user's sake (revisiting past topics is meaningful) and the model's (every turn ships the recent window, not the full archive). The bucketing rule is **active-window, not midnight**: when the chat surface opens, Captain resumes the most recent conversation if its last message was within 12 hours; otherwise it starts fresh on the next send. This handles "I'm hammering on a problem late into the night" (11pm → 1am stays together) and "I'm back the next day" (sleep, return to a fresh thread) without a hard date cliff. A small clock affordance in the chat header opens the history list — past threads in reverse-chronological order, each with a short LLM-generated title written in the background after the first exchange ("wax ring on the upstairs toilet"). Tap a row to pin the chat surface to that thread and continue it. Swipe to delete. A "Start a new conversation" button at the top of the list breaks threads on demand for users who'd rather decide for themselves. The window length is configurable via `CAPTAIN_ACTIVE_CONVERSATION_WINDOW_SECONDS` so we can tune it once real usage suggests a different number. Implementation: `conversations` table with denormalized `last_message_at` for cheap active lookup + cheap history sort; `backend/chat.py:maybe_generate_title` runs as part of the post-exchange background task; iOS surface in `ConversationHistoryView.swift`.
 
 Captain's chat behavior:
 
@@ -477,7 +479,7 @@ What makes this hard the right way:
 - **Notifications.** The Friday + Monday digests (§6.8) should fan out per person, calibrated to each personal profile's tone and timing preferences, but pulling from one shared home + calendar.
 - **The "biographer's instinct" stays singular.** Captain still speaks *about the home* in one voice. It just learns who's talking on each turn and adjusts how it speaks back.
 
-Worth designing the data model with this in mind sooner rather than later — even before the feature ships — because retrofitting multi-tenancy onto a single-user schema is the kind of thing that compounds in pain over time. The current single-home / single-conversation simplifications in v1 (see backend/store.py) should be expected to evolve. Some of that prep is already in: v1 carries a `users` table and a `user_id` FK on `home`; the profile rewriter is serialized by a per-process `threading.Lock` in `backend/profiles.py` so concurrent chat turns can't race the read-modify-write of `home.md` / `user.md` (when multi-home arrives, swap to a `dict[home_id, Lock]`). What's still pending: auth, per-home scoping on the in-memory job tables (`_jobs`, `_chat_jobs`, `_prerenders`), per-user push-notification routing, and the shared-chat-vs-separate question above.
+Worth designing the data model with this in mind sooner rather than later — even before the feature ships — because retrofitting multi-tenancy onto a single-user schema is the kind of thing that compounds in pain over time. The current single-home simplification in v1 (see backend/store.py) should be expected to evolve. Some of that prep is already in: v1 carries a `users` table and a `user_id` FK on `home`; multiple conversations per home are already a first-class concept (with active-window resume + history list — see §6.5); the profile rewriter is serialized by a per-process `threading.Lock` in `backend/profiles.py` so concurrent chat turns can't race the read-modify-write of `home.md` / `user.md` (when multi-home arrives, swap to a `dict[home_id, Lock]`). What's still pending: auth, per-home scoping on the in-memory job tables (`_jobs`, `_chat_jobs`, `_prerenders`), per-user push-notification routing, and the shared-chat-vs-separate question above.
 
 Related: the house passport (§11.1) is the *handoff* version of this same shape — many people over the home's lifetime, ownership changes hands. Multi-user is the *concurrent* version.
 

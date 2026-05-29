@@ -39,6 +39,9 @@ CALENDAR_MODEL = os.getenv("CAPTAIN_CALENDAR_MODEL", "gpt-5.4-nano")
 # Scope gate runs on every text message before the main chat call.
 # Nano-class — a yes/no/yes-but classifier, not a reasoning task.
 SCOPE_MODEL = os.getenv("CAPTAIN_SCOPE_MODEL", "gpt-5.4-nano")
+# Conversation titler runs once per new conversation after the first
+# exchange. Cheap nano call; output is 3-6 words.
+TITLE_MODEL = os.getenv("CAPTAIN_TITLE_MODEL", "gpt-5.4-nano")
 
 # Hardcoded for v1. When iOS sends a real address, first-session should
 # geocode and persist lat/lng to home row.
@@ -610,6 +613,7 @@ def respond_to_message(
     image_urls: list[str] | None = None,
     on_stage: Callable[..., None] | None = None,
     now: datetime | None = None,
+    conversation_id: int | None = None,
 ) -> dict:
     """Foreground: call LLM with full context + web-search tool, persist
     messages, return a structured result.
@@ -636,7 +640,15 @@ def respond_to_message(
     lng = home.get("lng") or DEFAULT_LNG
     weather = get_forecast_summary(lat, lng)
 
-    conv_id = store.get_or_create_conversation(home_id)
+    # Conversation routing: if iOS passed a specific conversation_id
+    # (history-list resume), use it; otherwise fall through to the
+    # active-conversation rule, which picks the most recent thread if
+    # it's within the active window or creates a fresh one.
+    now_unix = (now or datetime.now(timezone.utc).astimezone()).timestamp()
+    if conversation_id is not None and store.get_conversation(conversation_id):
+        conv_id = conversation_id
+    else:
+        conv_id = store.get_or_create_active_conversation(home_id, now=now_unix)
     history = store.get_recent_messages(conv_id, limit=20)
 
     system_prompt = _build_system_prompt(home, calendar, weather, now=now)
@@ -782,13 +794,63 @@ def respond_to_message(
         "text": assistant_text,
         "searches": searches,
         "product_picks": product_picks,
+        # Bubble the routed conversation_id back so the caller can
+        # report it to iOS (the client uses it to pin the chat surface
+        # to the right thread on the next send).
+        "conversation_id": conv_id,
     }
+
+
+def maybe_generate_title(conv_id: int) -> str | None:
+    """If this conversation doesn't have a title yet, generate a short
+    one from the first exchange. Skipped silently when there's not
+    enough material (under one user + assistant pair) or when a title
+    is already set. Soft-fails — no title is fine; iOS falls back to a
+    derived label."""
+    convo = store.get_conversation(conv_id)
+    if not convo or convo.get("title"):
+        return None
+    msgs = store.get_recent_messages(conv_id, limit=4)
+    has_user = any(m["role"] == "user" and m["content"].strip() for m in msgs)
+    has_assistant = any(m["role"] == "assistant" for m in msgs)
+    if not (has_user and has_assistant):
+        return None
+
+    body = "\n".join(
+        f"{m['role'].upper()}: {(m['content'] or '').strip()[:300]}"
+        for m in msgs[:4]
+    )
+    sys_prompt = (
+        "Summarize this short conversation as a 3-6 word title — plain "
+        "noun phrase, no quotes, no period, sentence-case first letter "
+        "only. The title will appear in a small history list, so it "
+        "should read like a chapter label, not a full sentence. "
+        "Examples: 'Wax ring on the upstairs toilet', 'Pet-safe lawn "
+        "options', 'Spring mulching plan'.\n\n"
+        f"{body}"
+    )
+    try:
+        resp = llm.chat_completion(
+            model=TITLE_MODEL,
+            messages=[{"role": "system", "content": sys_prompt}],
+            temperature=0.4,
+        )
+        title = resp.text.strip()
+    except Exception as e:  # noqa: BLE001
+        print(f"[title] generation failed for conv {conv_id}: {e}")
+        return None
+    if not title:
+        return None
+    store.set_conversation_title(conv_id, title)
+    print(f"[title] conv {conv_id}: {title!r}")
+    return title
 
 
 def explain_radar_item(
     home_id: int, item_type: str, item_text: str,
     *, now: datetime | None = None,
-) -> str:
+    conversation_id: int | None = None,
+) -> dict:
     """One-shot kickoff message Captain sends when the user taps a radar
     item to learn more. Uses the full chat system prompt (home, owner,
     calendar, weather, current date) plus recent chat history so the
@@ -808,7 +870,13 @@ def explain_radar_item(
     lng = home.get("lng") or DEFAULT_LNG
     weather = get_forecast_summary(lat, lng)
 
-    conv_id = store.get_or_create_conversation(home_id)
+    # Radar taps land in the explicitly-passed conversation when given
+    # (history-list resume), otherwise the active-conversation rule.
+    now_unix = (now or datetime.now(timezone.utc).astimezone()).timestamp()
+    if conversation_id is not None and store.get_conversation(conversation_id):
+        conv_id = conversation_id
+    else:
+        conv_id = store.get_or_create_active_conversation(home_id, now=now_unix)
     history = store.get_recent_messages(conv_id, limit=20)
 
     system_prompt = _build_system_prompt(
@@ -847,7 +915,7 @@ def explain_radar_item(
     assistant_text = resp.text
 
     store.add_message(conv_id, "assistant", assistant_text)
-    return assistant_text
+    return {"text": assistant_text, "conversation_id": conv_id}
 
 
 def extract_calendar_updates(home_id: int, user_message: str,
@@ -924,6 +992,7 @@ def update_memory_from_exchange(
     home_id: int, user_message: str, assistant_message: str,
     image_paths: list[Path] | None = None,
     *, now: datetime | None = None,
+    conversation_id: int | None = None,
 ) -> None:
     """Background entrypoint: rewrite markdown profiles AND extract any
     calendar entries from this exchange. The photos (if any) are passed to
@@ -933,7 +1002,12 @@ def update_memory_from_exchange(
 
     `now` is the user's current local datetime; threaded into calendar
     extraction so "today" / "tomorrow" resolve correctly against the
-    user's clock."""
+    user's clock.
+
+    `conversation_id`, when given, triggers a one-time background
+    title generation for that thread (no-op if already titled).
+    Scavenger-hunt and other non-chat callers leave it unset and skip
+    title work entirely."""
     try:
         profiles.update_profiles_from_exchange(
             user_message, assistant_message, image_paths=image_paths,
@@ -946,6 +1020,11 @@ def update_memory_from_exchange(
         )
     except Exception as e:  # noqa: BLE001
         print(f"[memory] calendar extraction failed: {e}")
+    if conversation_id is not None:
+        try:
+            maybe_generate_title(conversation_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[memory] title generation failed: {e}")
     # Profiles or calendar may have changed — drop the radar and
     # biographer caches so the next /radar and /biographer calls
     # regenerate against the fresh context. Cheap to invalidate; the

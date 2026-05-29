@@ -714,6 +714,7 @@ def _run_chat_job(
     chat_id: str, home_id: int, user_message: str,
     saved_photo_paths: list[Path], photo_urls: list[str],
     user_now: datetime,
+    conversation_id: int | None = None,
 ) -> None:
     """Worker thread for a single chat turn. Wraps respond_to_message
     with the stage callback so the iOS UI can show what Captain is
@@ -732,14 +733,19 @@ def _run_chat_job(
             image_urls=photo_urls,
             on_stage=on_stage,
             now=user_now,
+            conversation_id=conversation_id,
         )
-        # The latest message id is the assistant message we just persisted.
-        conv_id = store.get_or_create_conversation(home_id)
+        # Use the conversation_id the chat handler actually routed to —
+        # not whatever the caller passed — so iOS pins to the right
+        # thread even if the request omitted the id (default-active
+        # routing) or hit the auto-rollover case.
+        conv_id = outcome.get("conversation_id")
         latest = store.get_recent_messages(conv_id, limit=1)
         msg_id = latest[0]["id"] if latest else -1
 
         result = {
             "message_id": msg_id,
+            "conversation_id": conv_id,
             "response": outcome["text"],
             "image_urls": photo_urls,
             "searches": outcome.get("searches") or [],
@@ -747,13 +753,14 @@ def _run_chat_job(
         }
         _finish_chat_job(chat_id, result)
 
-        # Background: rewrite markdown profiles + extract calendar entries.
-        # Same as before — runs after we've already returned the result.
+        # Background: rewrite markdown profiles + extract calendar
+        # entries + (one-time per conversation) generate a title.
         try:
             chat_mod.update_memory_from_exchange(
                 home_id, user_message, outcome["text"],
                 saved_photo_paths,
                 now=user_now,
+                conversation_id=conv_id,
             )
         except Exception as e:  # noqa: BLE001
             print(f"[chat-job] memory update failed: {e}")
@@ -765,13 +772,16 @@ def _run_chat_job(
 
 def _send_canned_chat_reply(
     home_id: int, user_message: str, photo_urls: list[str],
-    canned_text: str,
+    canned_text: str, conversation_id: int | None = None,
 ) -> dict:
     """Persist the user message + a canned assistant reply, and skip the
     background memory update. Used for messages the scope gate flagged as
     off-topic or out-of-capability — those aren't real home conversations,
     so we don't want them poisoning the home/owner profile rewrite."""
-    conv_id = store.get_or_create_conversation(home_id)
+    if conversation_id is not None and store.get_conversation(conversation_id):
+        conv_id = conversation_id
+    else:
+        conv_id = store.get_or_create_active_conversation(home_id)
     store.add_message(
         conv_id, "user", user_message,
         image_urls=photo_urls if photo_urls else None,
@@ -779,6 +789,7 @@ def _send_canned_chat_reply(
     msg_id = store.add_message(conv_id, "assistant", canned_text)
     return {
         "message_id": msg_id,
+        "conversation_id": conv_id,
         "response": canned_text,
         "image_urls": photo_urls,
     }
@@ -810,6 +821,7 @@ async def chat(
     background_tasks: BackgroundTasks,
     message: Annotated[str, Form()] = "",
     photos: Annotated[Optional[List[UploadFile]], File()] = None,
+    conversation_id: Annotated[Optional[int], Form()] = None,
     x_captain_local_time: Annotated[Optional[str], Header()] = None,
 ) -> dict:
     """Multipart form:
@@ -866,7 +878,10 @@ async def chat(
             )
         else:
             assistant_text = chat_mod.fixture_chat_response(user_message)
-        conv_id = store.get_or_create_conversation(home_id)
+        if conversation_id is not None and store.get_conversation(conversation_id):
+            conv_id = conversation_id
+        else:
+            conv_id = store.get_or_create_active_conversation(home_id)
         store.add_message(
             conv_id, "user", user_message,
             image_urls=photo_urls if photo_urls else None,
@@ -876,6 +891,7 @@ async def chat(
             "status": "done",
             "result": {
                 "message_id": msg_id,
+                "conversation_id": conv_id,
                 "response": assistant_text,
                 "image_urls": photo_urls,
                 "fixture": True,
@@ -899,6 +915,7 @@ async def chat(
         inline = _send_canned_chat_reply(
             home_id, user_message, photo_urls,
             chat_mod.OFF_TOPIC_REPLY,
+            conversation_id=conversation_id,
         )
         # Wrap in the async envelope so iOS can use one polling client
         # for both inline and async cases.
@@ -907,6 +924,7 @@ async def chat(
         inline = _send_canned_chat_reply(
             home_id, user_message, photo_urls,
             chat_mod.OUT_OF_CAPABILITY_REPLY,
+            conversation_id=conversation_id,
         )
         return {"status": "done", "result": inline}
 
@@ -922,6 +940,7 @@ async def chat(
             chat_id, home_id, user_message,
             saved_photo_paths, photo_urls, user_now,
         ),
+        kwargs={"conversation_id": conversation_id},
         daemon=True,
     ).start()
 
@@ -961,13 +980,18 @@ def chat_status(chat_id: str) -> dict:
 async def explain_radar_item(
     item_type: Annotated[str, Form()],
     item_text: Annotated[str, Form()],
+    conversation_id: Annotated[Optional[int], Form()] = None,
     x_captain_local_time: Annotated[Optional[str], Header()] = None,
 ) -> dict:
     """Captain sends the first message in a chat the user just opened
     from a radar item — a tight 3-4 sentence what/why/when/how primer.
     iOS calls this when ChatView's onAppear sees a RadarKickoff. The
     assistant message is persisted directly (no fake user turn) and
-    returned for optimistic display."""
+    returned for optimistic display.
+
+    Radar taps always land in the user's current chat thread — if iOS
+    has a conversation_id pinned, that one; otherwise the active
+    conversation per the standard rule."""
     home = store.get_home()
     if not home:
         raise HTTPException(400, "no home yet")
@@ -976,14 +1000,15 @@ async def explain_radar_item(
 
     user_now = _parse_local_time(x_captain_local_time)
     try:
-        text = chat_mod.explain_radar_item(
+        outcome = chat_mod.explain_radar_item(
             home["id"], item_type, item_text, now=user_now,
+            conversation_id=conversation_id,
         )
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         raise HTTPException(500, f"radar explain failed: {e}") from e
 
-    conv_id = store.get_or_create_conversation(home["id"])
+    conv_id = outcome["conversation_id"]
     latest = store.get_recent_messages(conv_id, limit=1)
     msg_id = latest[0]["id"] if latest else -1
     store.log_event(
@@ -991,7 +1016,11 @@ async def explain_radar_item(
         home_id=home["id"],
         payload={"item_type": item_type},
     )
-    return {"message_id": msg_id, "response": text}
+    return {
+        "message_id": msg_id,
+        "conversation_id": conv_id,
+        "response": outcome["text"],
+    }
 
 
 @app.get("/weather")
@@ -1045,28 +1074,99 @@ def get_profile() -> dict:
 
 
 @app.get("/messages")
-def get_messages() -> dict:
-    """Hydrate the chat view on iOS launch / refresh."""
+def get_messages(
+    conversation_id: Optional[int] = None,
+    x_captain_local_time: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """Hydrate the chat view. With no `conversation_id`, returns the
+    active conversation (today's thread, by the active-window rule) so
+    the default-open chat surface stays continuous as the user comes
+    and goes during a session. With a specific `conversation_id`,
+    returns that thread's messages — used when iOS resumes a past
+    conversation from the history list."""
     home = store.get_home()
     if not home:
-        return {"messages": []}
-    conv_id = store.get_or_create_conversation(home["id"])
-    return {"messages": store.get_all_messages(conv_id)}
+        return {"messages": [], "conversation_id": None}
+    if conversation_id is not None and store.get_conversation(conversation_id):
+        conv_id = conversation_id
+    else:
+        user_now = _parse_local_time(x_captain_local_time)
+        conv_id = store.get_or_create_active_conversation(
+            home["id"], now=user_now.timestamp(),
+        )
+    return {
+        "messages": store.get_all_messages(conv_id),
+        "conversation_id": conv_id,
+    }
 
 
 @app.delete("/messages")
 def clear_messages() -> dict:
-    """Wipe the chat history for the current home. Profile + calendar +
-    rendering are untouched — just the chat scroll-back resets. Used by
-    the profile drawer's "clear chat history" affordance (also handy
-    after toggling fixture mode off, since fixture chats persist)."""
+    """Wipe ALL chat history for the current home (every conversation
+    + every message). Profile + calendar + rendering are untouched.
+    Used by the profile drawer's "Clear chat history" affordance — the
+    semantics match the v0 button (one-shot fresh slate); per-thread
+    deletion is via DELETE /conversations/{id}."""
     home = store.get_home()
     if not home:
         return {"deleted": 0}
-    conv_id = store.get_or_create_conversation(home["id"])
-    n = store.clear_messages(conv_id)
-    print(f"[messages] cleared {n} message(s) for home {home['id']}")
+    n = store.clear_all_conversations(home["id"])
+    print(f"[messages] cleared {n} conversation(s) for home {home['id']}")
     return {"deleted": n}
+
+
+# ---------- Conversations ----------
+
+@app.get("/conversations")
+def list_conversations() -> dict:
+    """All conversations for this home, newest activity first. Each
+    row carries title (may be null until the background titler runs),
+    timestamps, message count, and a short user snippet. iOS uses this
+    for the history list inside the chat surface."""
+    home = store.get_home()
+    if not home:
+        return {"conversations": []}
+    return {"conversations": store.list_conversations(home["id"])}
+
+
+@app.post("/conversations")
+def create_conversation_endpoint(
+    x_captain_local_time: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """Explicit 'start a new conversation' from the iOS history list.
+    Returns the new conversation row. Idempotent in spirit — calling
+    twice creates two threads — but iOS only calls this from a button,
+    so user intent is unambiguous."""
+    home = store.get_home()
+    if not home:
+        raise HTTPException(400, "no home yet")
+    user_now = _parse_local_time(x_captain_local_time)
+    conv_id = store.create_conversation(
+        home["id"], now=user_now.timestamp(),
+    )
+    convo = store.get_conversation(conv_id) or {}
+    return {
+        "id": conv_id,
+        "title": convo.get("title"),
+        "created_at": convo.get("created_at"),
+        "last_message_at": convo.get("last_message_at"),
+        "message_count": 0,
+        "first_user_text": None,
+    }
+
+
+@app.delete("/conversations/{conv_id}")
+def delete_conversation_endpoint(conv_id: int) -> dict:
+    """Remove a single conversation + its messages. iOS calls this from
+    a swipe-to-delete (or long-press) on a history row."""
+    home = store.get_home()
+    if not home:
+        raise HTTPException(404, "no home yet")
+    convo = store.get_conversation(conv_id)
+    if not convo or convo["home_id"] != home["id"]:
+        raise HTTPException(404, f"conversation {conv_id} not found")
+    ok = store.delete_conversation(conv_id)
+    return {"deleted": conv_id if ok else None}
 
 
 @app.delete("/calendar/{entry_id}")

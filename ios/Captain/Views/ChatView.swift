@@ -26,6 +26,10 @@ struct ChatView: View {
     /// follow up naturally. PRD §7.6: "When chat is opened from a
     /// specific context… the input is context-aware."
     var radarKickoff: RadarKickoff? = nil
+    /// When set, ChatView opens pinned to that specific past
+    /// conversation (set by the history sheet). When nil, the chat
+    /// surface loads the active conversation (the default-open case).
+    var initialConversationId: Int? = nil
 
     @Environment(\.dismiss) private var dismiss
 
@@ -33,6 +37,13 @@ struct ChatView: View {
     @State private var draft: String = ""
     @State private var isSending = false
     @State private var loadError: String?
+    /// The conversation this surface is currently pinned to. Set on
+    /// load (either from `initialConversationId` or the active rule)
+    /// and on every successful send so the backend's
+    /// active-conversation rollover stays in sync with what iOS shows.
+    @State private var conversationId: Int?
+    /// Drives the history sheet presentation.
+    @State private var showHistory = false
     /// What Captain is doing right now during an in-flight send. Drives
     /// the "thinking" bubble's content — animated dots for thinking /
     /// writing, a globe + query badge while a web search is in flight.
@@ -82,12 +93,19 @@ struct ChatView: View {
         sendStage = .thinking
         defer { isSending = false }
         do {
-            _ = try await CaptainAPI.explainRadarItem(
+            let resp = try await CaptainAPI.explainRadarItem(
                 itemType: kickoff.itemType,
                 itemText: kickoff.itemText,
+                conversationId: conversationId,
             )
-            let fresh = try await CaptainAPI.fetchMessages()
-            messages = fresh
+            if let landed = resp.conversationId {
+                conversationId = landed
+            }
+            let payload = try await CaptainAPI.fetchMessages(
+                conversationId: conversationId,
+            )
+            messages = payload.messages
+            conversationId = payload.conversationId
         } catch {
             loadError = "Couldn't load context: \(error.localizedDescription)"
         }
@@ -133,6 +151,19 @@ struct ChatView: View {
 
             Spacer()
 
+            // Browse past conversations + start a fresh thread. Quiet
+            // affordance — small clock glyph next to the overflow menu.
+            // Sheet is presented from the parent ZStack so dismissing
+            // it and re-opening the same chat surface stays smooth.
+            Button {
+                showHistory = true
+            } label: {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(CaptainTheme.textMuted)
+                    .frame(width: 32, height: 32)
+            }
+
             // Overflow menu for chat-level actions. Quiet by default —
             // the ellipsis is the only visible affordance.
             Menu {
@@ -161,7 +192,17 @@ struct ChatView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This wipes the chat scroll-back for this home. Your home profile, owner profile, and calendar aren't affected.")
+            Text("This wipes every past conversation for this home. Your home profile, owner profile, and calendar aren't affected.")
+        }
+        .sheet(isPresented: $showHistory) {
+            ConversationHistoryView(
+                currentConversationId: conversationId,
+                onPick: { picked in
+                    conversationId = picked
+                    showHistory = false
+                    Task { await loadMessages() }
+                }
+            )
         }
     }
 
@@ -171,6 +212,9 @@ struct ChatView: View {
         do {
             try await CaptainAPI.clearMessages()
             messages = []
+            // Backend just deleted every conversation row — drop the
+            // pinned id so the next send creates a fresh active thread.
+            conversationId = nil
         } catch {
             loadError = "clear failed: \(error.localizedDescription)"
         }
@@ -727,7 +771,11 @@ struct ChatView: View {
 
     private func loadMessages() async {
         do {
-            messages = try await CaptainAPI.fetchMessages()
+            let payload = try await CaptainAPI.fetchMessages(
+                conversationId: conversationId ?? initialConversationId,
+            )
+            messages = payload.messages
+            conversationId = payload.conversationId
         } catch {
             loadError = "couldn't load history: \(error.localizedDescription)"
         }
@@ -759,15 +807,25 @@ struct ChatView: View {
         )
         messages.append(optimistic)
         do {
-            _ = try await CaptainAPI.sendChatMessage(
+            let resp = try await CaptainAPI.sendChatMessage(
                 text,
                 photos: toSend,
+                conversationId: conversationId,
                 onStage: { stage in
                     sendStage = stage
                 }
             )
-            let fresh = try await CaptainAPI.fetchMessages()
-            messages = fresh
+            // Backend may have rolled the conversation (active-window
+            // expired between opens). Pin to whatever it routed to so
+            // the next send stays in the right thread.
+            if let landed = resp.conversationId {
+                conversationId = landed
+            }
+            let payload = try await CaptainAPI.fetchMessages(
+                conversationId: conversationId,
+            )
+            messages = payload.messages
+            conversationId = payload.conversationId
         } catch {
             messages.removeAll { $0.id == optimistic.id }
             loadError = "send failed: \(error.localizedDescription)"

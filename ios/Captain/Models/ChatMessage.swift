@@ -55,6 +55,11 @@ struct ChatMessage: Codable, Equatable, Identifiable, Hashable {
 /// /chat/{chat_id} until done.
 struct ChatResponse: Codable {
     let messageId: Int
+    /// Conversation the message landed in. Used to pin the chat surface
+    /// to the right thread when the active-conversation rule rolls over
+    /// on the backend (a fresh conversation gets created and iOS hasn't
+    /// learned about it yet).
+    let conversationId: Int?
     let response: String
     /// Echoed back when the request included photos.
     let imageUrls: [String]?
@@ -71,6 +76,7 @@ struct ChatResponse: Codable {
 
     enum CodingKeys: String, CodingKey {
         case messageId = "message_id"
+        case conversationId = "conversation_id"
         case response
         case imageUrls = "image_urls"
         case fixture
@@ -113,7 +119,15 @@ struct ChatStatus: Codable {
     }
 }
 
-/// Response from GET /messages.
+/// Response from GET /messages. `conversationId` is the thread these
+/// messages came from — null only when the home has no conversations
+/// yet (brand-new home, before the first chat turn).
 struct MessagesResponse: Codable {
     let messages: [ChatMessage]
+    let conversationId: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case messages
+        case conversationId = "conversation_id"
+    }
 }

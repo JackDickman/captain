@@ -13,6 +13,7 @@ own JSON-encoding for blob fields where noted.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -81,9 +82,20 @@ CREATE INDEX IF NOT EXISTS idx_calendar_home ON calendar_entries(home_id);
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     home_id INTEGER NOT NULL,
+    -- Short LLM-generated label ("replacing the wax ring", "spring
+    -- mulching plan"). NULL until the first exchange runs the
+    -- background titler. iOS falls back to a derived label.
+    title TEXT,
+    -- Denormalized timestamp of the most recent message so the
+    -- "active conversation" lookup is a single indexed query and the
+    -- history list can sort newest-first without joining messages.
+    last_message_at REAL,
     created_at REAL NOT NULL,
     FOREIGN KEY (home_id) REFERENCES home(id)
 );
+-- idx_conversations_home is created in init_db AFTER the ALTER TABLE
+-- migrations run, so existing pre-migration DBs get the column before
+-- the index references it.
 
 CREATE TABLE IF NOT EXISTS hunt_progress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,11 +175,23 @@ def init_db() -> None:
             # home rows get DEFAULT 1 so they continue to belong to the
             # single v1 user.
             "ALTER TABLE home ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1",
+            # Conversation history v1: title + denormalized last-message
+            # timestamp on every conversation row so the history list +
+            # active-conversation lookup are cheap.
+            "ALTER TABLE conversations ADD COLUMN title TEXT",
+            "ALTER TABLE conversations ADD COLUMN last_message_at REAL",
         ]:
             try:
                 c.execute(ddl)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Indexes that reference migrated columns — created here so
+        # they run after the ALTER TABLEs above add the column on
+        # pre-migration DBs.
+        c.execute(
+            """CREATE INDEX IF NOT EXISTS idx_conversations_home
+                 ON conversations(home_id, last_message_at)"""
+        )
         # Seed the single v1 user if it doesn't exist yet. CONFLICT(id)
         # is a no-op on re-init.
         c.execute(
@@ -345,19 +369,164 @@ def get_calendar(home_id: int, limit: int = 50) -> list[dict]:
 
 # ---------- conversation + messages ----------
 
-def get_or_create_conversation(home_id: int) -> int:
+# "Active" window: the most recent conversation is auto-resumed when its
+# last message was within this many seconds. Twelve hours covers both
+# the "still hammering on the same problem after a break" case and the
+# "midnight cliff" case (a message at 11:55 PM and one at 12:30 AM stay
+# together). Anything older than that on next send starts a fresh
+# conversation. Twelve hours is a heuristic — tuneable by env var so we
+# can adjust without a deploy if real usage suggests a different number.
+ACTIVE_CONVERSATION_WINDOW_SECONDS = int(
+    os.getenv("CAPTAIN_ACTIVE_CONVERSATION_WINDOW_SECONDS", "")
+    or 12 * 60 * 60
+)
+
+
+def _most_recent_conversation(home_id: int) -> sqlite3.Row | None:
+    """Most-recently-active conversation row for this home, by
+    last_message_at (falling back to created_at for rows that have
+    never received a message). None when the home has no conversations
+    yet."""
     with connect() as c:
-        row = c.execute(
-            "SELECT id FROM conversations WHERE home_id = ? LIMIT 1",
+        return c.execute(
+            """SELECT id, title, last_message_at, created_at
+               FROM conversations WHERE home_id = ?
+               ORDER BY COALESCE(last_message_at, created_at) DESC
+               LIMIT 1""",
             (home_id,),
         ).fetchone()
-        if row:
-            return row["id"]
+
+
+def create_conversation(
+    home_id: int, *, now: float | None = None, title: str | None = None,
+) -> int:
+    """Append a fresh conversation row for this home and return its id.
+    `now` is unix epoch — pass the user's local-clock now() when you
+    have it so the conversation's created_at matches when the user
+    started talking, not when the worker thread ran the insert."""
+    ts = now if now is not None else time.time()
+    with connect() as c:
         cur = c.execute(
-            "INSERT INTO conversations (home_id, created_at) VALUES (?, ?)",
-            (home_id, time.time()),
+            """INSERT INTO conversations
+                 (home_id, title, created_at, last_message_at)
+               VALUES (?, ?, ?, NULL)""",
+            (home_id, title, ts),
         )
         return cur.lastrowid
+
+
+def get_or_create_active_conversation(
+    home_id: int, *, now: float | None = None,
+) -> int:
+    """Return the id of the conversation the next user message should
+    land in. Rule: pick the most recent conversation if its last
+    message was within `ACTIVE_CONVERSATION_WINDOW_SECONDS`; otherwise
+    create a fresh one. A brand-new home creates its first conversation
+    here on the first chat turn."""
+    ts = now if now is not None else time.time()
+    row = _most_recent_conversation(home_id)
+    if row is not None:
+        anchor = row["last_message_at"] or row["created_at"]
+        if ts - anchor <= ACTIVE_CONVERSATION_WINDOW_SECONDS:
+            return row["id"]
+    return create_conversation(home_id, now=ts)
+
+
+def get_or_create_conversation(home_id: int) -> int:
+    """Back-compat shim — delegates to the active-conversation helper.
+    Existing callers that didn't carry a clock just want "the chat
+    conversation right now," which is what the active rule resolves to.
+    """
+    return get_or_create_active_conversation(home_id)
+
+
+def get_conversation(conv_id: int) -> dict | None:
+    """Single conversation by id. Used by the chat handler to verify a
+    user-supplied conversation_id and to read the current title before
+    deciding whether to regenerate it."""
+    with connect() as c:
+        row = c.execute(
+            """SELECT id, home_id, title, created_at, last_message_at
+               FROM conversations WHERE id = ?""",
+            (conv_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_conversations(home_id: int) -> list[dict]:
+    """All conversations for this home, newest activity first. Each row
+    carries enough metadata for the iOS history list — title (may be
+    null), timestamps, message count, and a short snippet of the first
+    user message for the fallback label / preview line."""
+    with connect() as c:
+        rows = c.execute(
+            """SELECT c.id, c.title, c.created_at, c.last_message_at,
+                      (SELECT COUNT(*) FROM messages m
+                       WHERE m.conversation_id = c.id) AS message_count,
+                      (SELECT m.content FROM messages m
+                       WHERE m.conversation_id = c.id AND m.role = 'user'
+                       ORDER BY m.id ASC LIMIT 1) AS first_user_text
+               FROM conversations c WHERE c.home_id = ?
+               ORDER BY COALESCE(c.last_message_at, c.created_at) DESC""",
+            (home_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_conversation_title(conv_id: int, title: str) -> None:
+    """Persist a (probably LLM-generated) title for a conversation.
+    Trimmed + capped at 80 chars to keep the iOS list from overflowing."""
+    clean = (title or "").strip().strip('"').strip("'")[:80]
+    if not clean:
+        return
+    with connect() as c:
+        c.execute(
+            "UPDATE conversations SET title = ? WHERE id = ?",
+            (clean, conv_id),
+        )
+
+
+def touch_conversation(conv_id: int, *, when: float | None = None) -> None:
+    """Bump `last_message_at` so the active-conversation lookup picks
+    this thread up next time. Called from add_message — callers don't
+    need to invoke it directly."""
+    ts = when if when is not None else time.time()
+    with connect() as c:
+        c.execute(
+            "UPDATE conversations SET last_message_at = ? WHERE id = ?",
+            (ts, conv_id),
+        )
+
+
+def delete_conversation(conv_id: int) -> bool:
+    """Remove one conversation and every message inside it. Returns
+    True if a row was deleted. Used by the iOS history list's per-row
+    delete affordance."""
+    with connect() as c:
+        c.execute(
+            "DELETE FROM messages WHERE conversation_id = ?", (conv_id,)
+        )
+        cur = c.execute(
+            "DELETE FROM conversations WHERE id = ?", (conv_id,)
+        )
+        return cur.rowcount > 0
+
+
+def clear_all_conversations(home_id: int) -> int:
+    """Wipe every message AND every conversation row for the home.
+    Used by the profile drawer's "Clear chat history" affordance —
+    preserves the v0 semantics (clear button = fresh slate)."""
+    with connect() as c:
+        c.execute(
+            """DELETE FROM messages
+               WHERE conversation_id IN
+                 (SELECT id FROM conversations WHERE home_id = ?)""",
+            (home_id,),
+        )
+        cur = c.execute(
+            "DELETE FROM conversations WHERE home_id = ?", (home_id,)
+        )
+        return cur.rowcount
 
 
 def _hydrate_message_row(r: sqlite3.Row) -> dict:
@@ -413,6 +582,7 @@ def add_message(
     urls_json = json.dumps(image_urls) if image_urls else None
     picks_json = json.dumps(product_picks) if product_picks else None
     searches_json = json.dumps(searches) if searches else None
+    now = time.time()
     with connect() as c:
         cur = c.execute(
             """INSERT INTO messages
@@ -420,7 +590,16 @@ def add_message(
                   image_urls, product_picks, searches, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (conversation_id, role, content,
-             urls_json, picks_json, searches_json, time.time()),
+             urls_json, picks_json, searches_json, now),
+        )
+        # Keep the conversation's last_message_at in sync so the
+        # active-conversation lookup and the history list both see
+        # this turn immediately. Done in the same connection (and
+        # autocommit) so a concurrent reader never sees one without
+        # the other.
+        c.execute(
+            "UPDATE conversations SET last_message_at = ? WHERE id = ?",
+            (now, conversation_id),
         )
         return cur.lastrowid
 
