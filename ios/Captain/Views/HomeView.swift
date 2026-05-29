@@ -149,14 +149,20 @@ struct HomeView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     Spacer().frame(height: 18)
                     heroImage
+                    // Widget stack — priority order: hunt (when the
+                    // user is mid-tour), biographer (when Captain has
+                    // something to recall), radar (always present),
+                    // weather (always present).
                     if let hunt, !hunt.complete {
                         Spacer().frame(height: 14)
                         huntBanner(hunt)
                             .padding(.horizontal, 24)
                     }
-                    Spacer().frame(height: 14)
-                    WeatherWidget(periods: weatherPeriods)
-                        .padding(.horizontal, 24)
+                    if let biographer {
+                        Spacer().frame(height: 10)
+                        BiographerWidget(recall: biographer)
+                            .padding(.horizontal, 24)
+                    }
                     Spacer().frame(height: 10)
                     RadarStrip(radar: radar, isLoading: radarLoading) {
                         if radar != nil {
@@ -171,17 +177,11 @@ struct HomeView: View {
                     }
                     .padding(.horizontal, 24)
                     .gestureHint(.radarCard)
+                    Spacer().frame(height: 10)
+                    WeatherWidget(periods: weatherPeriods)
+                        .padding(.horizontal, 24)
                     Spacer().frame(height: 12)
                 }
-            }
-            // Biographer line — Captain speaking unbidden when the home
-            // has a calendar anniversary today. Sits just above the chat
-            // capsule so it reads as a quiet aside, not a header.
-            if let biographer {
-                biographerLine(biographer)
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 8)
-                    .transition(.opacity)
             }
             // Bottom chat capsule sits inline in the column now (no
             // walnut surface beneath it) — the cream background runs
@@ -190,24 +190,6 @@ struct HomeView: View {
             chatCapsule
                 .padding(.horizontal, 20)
                 .padding(.bottom, 12)
-        }
-    }
-
-    /// Quiet, decorative "on this day" line. Italics + muted tone so it
-    /// reads as an aside, not an instruction. Single line, truncates
-    /// rather than wraps — Captain shouldn't dominate the home screen.
-    private func biographerLine(_ recall: BiographerRecall) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "book.closed.fill")
-                .font(.system(size: 11))
-                .foregroundStyle(CaptainTheme.brass.opacity(0.7))
-            Text(recall.text)
-                .font(CaptainTheme.body(13))
-                .italic()
-                .foregroundStyle(CaptainTheme.textMuted)
-                .lineLimit(2)
-                .minimumScaleFactor(0.9)
-            Spacer(minLength: 0)
         }
     }
 
