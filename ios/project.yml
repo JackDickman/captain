@@ -20,6 +20,7 @@ targets:
       - path: Captain
     settings:
       base:
+        PRODUCT_NAME: Captain
         TARGETED_DEVICE_FAMILY: "1"  # iPhone only
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
