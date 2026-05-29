@@ -152,15 +152,16 @@ struct ChatView: View {
             Spacer()
 
             // Browse past conversations + start a fresh thread. Quiet
-            // affordance — small clock glyph next to the overflow menu.
-            // Sheet is presented from the parent ZStack so dismissing
-            // it and re-opening the same chat surface stays smooth.
+            // affordance — small clock glyph in brass to distinguish
+            // it from the overflow menu (a real destination, not an
+            // overflow). Tap target matches the avatar/icon size used
+            // on the home screen for visual consistency.
             Button {
                 showHistory = true
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(CaptainTheme.textMuted)
+                    .foregroundStyle(CaptainTheme.brass)
                     .frame(width: 32, height: 32)
             }
 
