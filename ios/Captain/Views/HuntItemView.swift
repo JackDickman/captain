@@ -68,6 +68,7 @@ struct HuntItemView: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 16)
                 }
+                .captainScrollEdgeFade()
             }
         }
         .onAppear {

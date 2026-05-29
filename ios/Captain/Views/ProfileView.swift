@@ -24,6 +24,7 @@ struct ProfileView: View {
                 header
                 tabBar
                 ScrollView { content.padding(.horizontal, 20).padding(.vertical, 18) }
+                    .captainScrollEdgeFade()
             }
         }
         .task { await load() }

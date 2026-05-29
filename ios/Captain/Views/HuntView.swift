@@ -49,6 +49,7 @@ struct HuntView: View {
                         .padding(.horizontal, 20)
                         .padding(.top, 14)
                     }
+                    .captainScrollEdgeFade()
                 } else if let loadError {
                     Spacer()
                     Text(loadError)

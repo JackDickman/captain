@@ -249,6 +249,10 @@ struct ChatView: View {
                 }
                 .padding(.vertical, 18)
             }
+            // Same cushion as every other scrolling surface in Captain
+            // — message bubbles fade softly under the chat header above
+            // and into the input bar below instead of clipping hard.
+            .captainScrollEdgeFade()
             .onChange(of: messages.count) { _, _ in
                 guard let last = messages.last else { return }
                 withAnimation {

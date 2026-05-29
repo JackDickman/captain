@@ -183,12 +183,9 @@ struct HomeView: View {
                     Spacer().frame(height: 12)
                 }
             }
-            // Soft cream fade at the top and bottom edges of the scroll
-            // area so widgets don't hard-collide with the pinned
-            // address row above or the chat capsule below. The mask
-            // operates on the ScrollView's own bounds, so the fade
-            // distance stays constant whatever the content height.
-            .mask(scrollFadeMask)
+            // Shared edge fade so the home screen behaves identically
+            // to every other scrolling surface in the app.
+            .captainScrollEdgeFade()
             // Bottom chat capsule sits inline in the column now (no
             // walnut surface beneath it) — the cream background runs
             // unbroken from the home image all the way to the safe
@@ -196,32 +193,6 @@ struct HomeView: View {
             chatCapsule
                 .padding(.horizontal, 20)
                 .padding(.bottom, 12)
-        }
-    }
-
-    /// Vertical alpha mask: opaque in the middle, ~22pt of fade at the
-    /// top and ~26pt at the bottom. The slightly heavier bottom fade
-    /// gives the chat capsule a bit more breathing room since it's the
-    /// only floating-feeling element below; the top fade only has to
-    /// cushion content sliding under flat type.
-    private var scrollFadeMask: some View {
-        GeometryReader { proxy in
-            let h = proxy.size.height
-            // Guard against zero-height on first layout — division by
-            // zero would crash the gradient stops; a sane default keeps
-            // SwiftUI's pre-measure pass quiet.
-            let topFrac = h > 0 ? min(22 / h, 0.2) : 0.03
-            let bottomFrac = h > 0 ? min(26 / h, 0.2) : 0.04
-            LinearGradient(
-                stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .black, location: topFrac),
-                    .init(color: .black, location: 1 - bottomFrac),
-                    .init(color: .clear, location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
         }
     }
 

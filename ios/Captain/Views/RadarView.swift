@@ -67,6 +67,7 @@ struct RadarView: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 16)
                 }
+                .captainScrollEdgeFade()
             }
         }
     }

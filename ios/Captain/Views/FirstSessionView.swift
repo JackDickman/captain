@@ -84,6 +84,10 @@ struct FirstSessionView: View {
             .padding(.top, 56)
             .padding(.bottom, 32)
         }
+        // Same scroll-edge fade every other surface uses — softens the
+        // Captain wordmark feathering under the notch on small phones
+        // and the submit button sliding against the bottom safe area.
+        .captainScrollEdgeFade()
     }
 
     private var header: some View {
